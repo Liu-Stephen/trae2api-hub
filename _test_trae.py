@@ -1154,27 +1154,32 @@ def test_solo_channel():
                   len(calls) == 1 and calls[0]["function"]["arguments"] == '{"city":"北京"}', calls)
             check("集成：finish_reason 改成 tool_calls", out["finish_reason"] == "tool_calls")
 
-            def _expect_error(lines, label, payload=None):
+            def _expect_graceful(lines, label, check_fn, payload=None):
                 try:
-                    _run(lines, dict(payload or base))
-                except RuntimeError:
-                    check(label, True)
+                    out = _run(lines, dict(payload or base))
                 except Exception as exc:            # noqa: BLE001
-                    check(label, False, "%s: %s" % (type(exc).__name__, exc))
-                else:
-                    check(label, False, "没有报错")
+                    check(label, False, "不应抛错: %s: %s"
+                          % (type(exc).__name__, exc))
+                    return
+                check(label, check_fn(out), out)
 
-            _expect_error([
+            _expect_graceful([
                 'data:{"tool_calls":[{"index":0,"id":"x","function_call":'
                 '{"name":"get_weather","arguments":"{\\"city\\":"}}]}',
                 'data:{"finish_reason":"stop"}',
-            ], "集成：截断 arguments 报错")
-            _expect_error([
+            ], "集成：截断 arguments 只丢该调用，不抛错",
+                lambda out: out.get("tool_calls") == [])
+            _expect_graceful([
                 'data:{"tool_calls":[{"index":0,"id":"x","function_call":'
                 '{"name":"get_weather","arguments":"{\\"city\\":\\"北京\\"}"}}]}',
                 'data:{"finish_reason":"length"}',
-            ], "集成：finish_reason=length 报错")
-            _expect_error(['data:{"finish_reason":"stop"}'], "集成：空内容报错")
+            ], "集成：finish_reason=length 丢弃不完整调用，保留终止原因",
+                lambda out: out.get("tool_calls") == []
+                and out.get("finish_reason") == "length")
+            _expect_graceful(['data:{"finish_reason":"stop"}'],
+                             "集成：空内容不抛错（交给客户端按空回复处理）",
+                             lambda out: out.get("content") == ""
+                             and out.get("finish_reason") == "stop")
         finally:
             proxy.urllib.request.urlopen = real_urlopen
             if real_pool is not None:

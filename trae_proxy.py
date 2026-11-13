@@ -5998,25 +5998,209 @@ def _solo_data_object(line):
     return event if isinstance(event, dict) else None
 
 
-def _solo_tools(payload):
+class SoloUpstreamError(RuntimeError):
+    """SOLO 上游失败：带 HTTP 语义，供调用方决定「换号 / 冷却 / 直接失败」。
+
+    与裸 RuntimeError 的区别只有可分类性：status 是应回给客户端的 HTTP 码，
+    retryable=False 表示参数/模型问题（换号也没用）。
+    """
+
+    def __init__(self, message, status=502, detail="", retryable=True):
+        super(SoloUpstreamError, self).__init__(message)
+        self.status = int(status or 502)
+        self.detail = str(detail or message or "")
+        self.retryable = bool(retryable)
+
+
+def _solo_error_info(exc):
+    """异常 -> (http_status, detail, retryable)。任何异常都有确定结论。"""
+    if isinstance(exc, SoloUpstreamError):
+        return int(exc.status or 502), (exc.detail or str(exc)), bool(exc.retryable)
+    if isinstance(exc, RateLimited):
+        return 429, (getattr(exc, "detail", "") or str(exc)), True
+    if isinstance(exc, UpstreamStatus):
+        try:
+            status = int(exc.status)
+        except Exception:
+            status = 502
+        detail = getattr(exc, "detail", "") or str(exc)
+        retryable = status >= 500 or status in (401, 403, 429)
+        return status, detail, retryable
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(exc.code), str(exc), True
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return 504, (str(exc) or "upstream timed out"), True
+    return 502, (str(exc) or "solo upstream error"), True
+
+
+def _solo_error_frame(message, status=502):
+    """流式路径的 in-band 错误帧（OpenAI 风格），用于已经发出 200 之后。"""
+    try:
+        code = int(status)
+    except Exception:
+        code = 502
+    payload = {"error": {"message": str(message or "solo upstream error")[:400],
+                         "type": "upstream_error", "code": code}}
+    return ("data: " + json.dumps(payload, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _solo_ready_total(realm, model=None):
+    """本区当前可轮换的就绪账号数（测试桩没有 count_ready 时退回账号数）。"""
+    try:
+        if POOL is not None:
+            return int(POOL.count_ready(realm, model=model))
+    except Exception:
+        pass
+    try:
+        return len(getattr(POOL, "accounts", []) or [])
+    except Exception:
+        return 0
+
+
+def _solo_note_failure(account, status, detail, total):
+    """把一次 SOLO 失败写回账号（单号池不冻结，避免「越修越不可用」）。"""
+    if account is None or not hasattr(account, "note_error"):
+        return
+    try:
+        if status in (401, 403):
+            # 多号池：进鉴权熔断；单号池：只记录，不冻结（没有别的号可换）
+            if total > 1:
+                account.note_error(detail, code=status)
+            else:
+                account.note_error(detail, cooldown=0)
+        elif status == 429:
+            account.note_error(detail, code=429, cooldown=30)
+        elif status >= 500 or status == 504:
+            account.note_error(detail, cooldown=(15 if total > 1 else 0))
+        else:
+            account.note_error(detail, cooldown=0)
+    except Exception:
+        pass
+
+
+def _solo_empty_content(value):
+    if value is None or value == "":
+        return True
+    if isinstance(value, list):
+        return not value
+    return False
+
+
+def _solo_merge_adjacent_tool_calls(messages):
+    """把被拆成多条 assistant 的并行 tool_calls 合回一条（上游要求同一批）。"""
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    out = []
+    for message in messages:
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        if (message.get("role") == "assistant" and out
+                and isinstance(out[-1], dict)
+                and out[-1].get("role") == "assistant"):
+            prev = out[-1]
+            calls = message.get("tool_calls")
+            prev_calls = prev.get("tool_calls")
+            if (isinstance(calls, list) and calls
+                    and _solo_empty_content(message.get("content"))
+                    and isinstance(prev_calls, list) and prev_calls):
+                prev["tool_calls"] = list(prev_calls) + list(calls)
+                continue
+        out.append(message)
+    return out
+
+
+def _solo_cleanup_orphan_tool_calls(messages):
+    """丢弃没有结果的 tool_call 与没有对应调用的 tool 消息。"""
+    if not isinstance(messages, list) or not messages:
+        return messages
+    call_ids, result_ids = set(), set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            tid = message.get("tool_call_id")
+            if isinstance(tid, str) and tid:
+                result_ids.add(tid)
+        elif message.get("role") == "assistant":
+            for call in (message.get("tool_calls") or []):
+                if isinstance(call, dict):
+                    tid = call.get("id")
+                    if isinstance(tid, str) and tid:
+                        call_ids.add(tid)
+    if not call_ids and not result_ids:
+        return messages
+    keep = call_ids & result_ids
+    out = []
+    for message in messages:
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        role = message.get("role")
+        if role == "tool":
+            tid = message.get("tool_call_id")
+            if isinstance(tid, str) and tid and tid not in keep:
+                log("solo: dropped tool result without a matching call (%s)"
+                    % tid[:24], level="WARN", tag="chat")
+                continue
+        elif role == "assistant" and isinstance(message.get("tool_calls"), list):
+            calls = message["tool_calls"]
+            kept = [c for c in calls
+                    if isinstance(c, dict) and c.get("id") in keep]
+            if len(kept) != len(calls):
+                log("solo: dropped %d tool_call(s) without a result"
+                    % (len(calls) - len(kept)), level="WARN", tag="chat")
+                if kept:
+                    message = dict(message, tool_calls=kept)
+                else:
+                    message = {k: v for k, v in message.items()
+                               if k != "tool_calls"}
+        out.append(message)
+    return out
+
+
+def _solo_tools(payload, strict=True):
     """调用方 tools -> 上游 SOLO tools。
 
     上游 FunctionDefinition.tools[].function.parameters 是 string；直接把 OpenAI 的
     dict 发过去会 4001: json: cannot unmarshal object into Go struct field
     FunctionDefinition.tools.function.parameters of type string。
+
+    strict=True 保留旧行为（无 function 的工具原样透传）；strict=False 用于生产
+    路径：丢掉上游必然拒绝的形状（无 function / 非法名字 / 重名），避免一个坏工具
+    把整次请求变成 4001。
     """
     tools = payload.get("tools")
     if not isinstance(tools, list) or not tools:
         return []
     out = []
+    seen = set()
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         fn = tool.get("function")
         if not isinstance(fn, dict):
-            out.append(tool)
+            if strict:
+                out.append(tool)
+            else:
+                log("solo: dropped tool without a function schema: %r"
+                    % (tool.get("type") or tool.get("name") or "?"),
+                    level="WARN", tag="chat")
             continue
         fn = dict(fn)
+        name = str(fn.get("name") or "").strip()
+        if not strict:
+            if not re.match(r"^[A-Za-z0-9_-]{1,64}$", name):
+                log("solo: dropped tool with an unusable name %r" % name,
+                    level="WARN", tag="chat")
+                continue
+            if name in seen:
+                log("solo: dropped duplicate tool %r" % name,
+                    level="WARN", tag="chat")
+                continue
+            seen.add(name)
+        fn["name"] = name
         params = fn.get("parameters")
         if isinstance(params, (dict, list)):
             fn["parameters"] = json.dumps(params, ensure_ascii=False)
@@ -6024,7 +6208,7 @@ def _solo_tools(payload):
     return out
 
 
-def _solo_messages(payload):
+def _solo_messages(payload, strict=True):
     """调用方 messages -> SOLO messages（保留工具往返需要的消息结构）。
 
     两个上游约束：
@@ -6032,9 +6216,16 @@ def _solo_messages(payload):
         工具调用当成不存在，多轮往返 /v1/chat/completions 直接掉链子；
       · tool 回执上游要 tool_call_id + name，而 OpenAI 的 tool 消息只有 tool_call_id，
         所以先从历史 assistant.tool_calls 建 id -> name 映射。
+
+    strict=False（生产路径）不抛错：缺名字的调用/回执按「丢弃 + 留痕」处理，并先
+    合并被拆开的并行调用、清理孤儿调用，避免一条坏历史让整段对话永久 502。
     """
+    messages_in = payload.get("messages") or []
+    if not strict and isinstance(messages_in, list):
+        messages_in = _solo_merge_adjacent_tool_calls(messages_in)
+        messages_in = _solo_cleanup_orphan_tool_calls(messages_in)
     id_to_name = {}
-    for item in payload.get("messages") or []:
+    for item in messages_in:
         if not isinstance(item, dict) or str(item.get("role") or "") != "assistant":
             continue
         for call in item.get("tool_calls") or []:
@@ -6045,7 +6236,7 @@ def _solo_messages(payload):
             if call_id and fn.get("name"):
                 id_to_name[call_id] = str(fn["name"])
     messages = []
-    for item in payload.get("messages") or []:
+    for item in messages_in:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "user")
@@ -6072,7 +6263,11 @@ def _solo_messages(payload):
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
                 name = str(fn.get("name") or "").strip()
                 if not name:
-                    raise RuntimeError("assistant.tool_calls 缺少 function.name，无法回灌上游")
+                    if strict:
+                        raise RuntimeError("assistant.tool_calls 缺少 function.name，无法回灌上游")
+                    log("solo: dropped assistant tool_call without a name (index=%d)"
+                        % index, level="WARN", tag="chat")
+                    continue
                 arguments = fn.get("arguments")
                 if isinstance(arguments, (dict, list)):
                     arguments = json.dumps(arguments, ensure_ascii=False)
@@ -6093,36 +6288,64 @@ def _solo_messages(payload):
             call_id = str(item.get("tool_call_id") or "").strip()
             name = id_to_name.get(call_id) or str(item.get("name") or "").strip()
             if not call_id:
-                raise RuntimeError("tool 消息缺少 tool_call_id，无法回灌上游")
+                if strict:
+                    raise RuntimeError("tool 消息缺少 tool_call_id，无法回灌上游")
+                log("solo: dropped tool message without a tool_call_id",
+                    level="WARN", tag="chat")
+                continue
             if not name:
-                raise RuntimeError("无法把 tool_call_id 映射到工具名（历史里缺少对应 assistant.tool_calls）")
+                if strict:
+                    raise RuntimeError("无法把 tool_call_id 映射到工具名（历史里缺少对应 assistant.tool_calls）")
+                log("solo: dropped tool message %s: no name mapping"
+                    % call_id[:24], level="WARN", tag="chat")
+                continue
             message["tool_call_id"] = call_id
             message["name"] = name
         if not message["content"] and not message.get("tool_calls"):
             continue
         messages.append(message)
+    if not strict:
+        messages = _solo_cleanup_orphan_tool_calls(messages)
     return messages
 
 
-def _solo_tool_calls(slots):
-    """按 index 聚合的槽位 -> OpenAI tool_calls；字段不全直接报错，不伪造空参数。"""
+def _solo_tool_calls(slots, strict=True):
+    """按 index 聚合的槽位 -> OpenAI tool_calls。
+
+    strict=True：字段不全直接报错，不伪造空参数（旧行为，供直接调用/测试）。
+    strict=False：坏调用**只丢这一条**并留痕，不把整次请求变成 502。
+    """
     out = []
     for index in sorted(slots):
-        slot = slots[index]
+        slot = slots.get(index) or {}
         name = str(slot.get("name") or "").strip()
         if not name:
-            raise RuntimeError("solo tool_calls 缺少 function name（index=%s）" % index)
+            if strict:
+                raise RuntimeError("solo tool_calls 缺少 function name（index=%s）" % index)
+            log("solo: dropped tool_call without a name (index=%s)" % index,
+                level="WARN", tag="chat")
+            continue
         arguments = str(slot.get("arguments") or "")
         if not arguments:
-            raise RuntimeError("solo tool_calls 缺少 arguments（%s）" % name)
+            if strict:
+                raise RuntimeError("solo tool_calls 缺少 arguments（%s）" % name)
+            arguments = "{}"
         # 上游是增量拼接的 arguments；截断/畸形时绝不能当成可执行调用发下去
         try:
             parsed = json.loads(arguments)
         except Exception:
-            raise RuntimeError("solo tool_calls 的 arguments 不是完整 JSON（%s）: %s"
-                               % (name, arguments[:120]))
+            if strict:
+                raise RuntimeError("solo tool_calls 的 arguments 不是完整 JSON（%s）: %s"
+                                   % (name, arguments[:120]))
+            log("solo: dropped tool_call %s with truncated/invalid JSON arguments: %s"
+                % (name, arguments[:120]), level="WARN", tag="chat")
+            continue
         if not isinstance(parsed, dict):
-            raise RuntimeError("solo tool_calls 的 arguments 不是 JSON 对象（%s）" % name)
+            if strict:
+                raise RuntimeError("solo tool_calls 的 arguments 不是 JSON 对象（%s）" % name)
+            log("solo: dropped tool_call %s: arguments is not a JSON object" % name,
+                level="WARN", tag="chat")
+            continue
         out.append({
             "index": index,
             "id": str(slot.get("id") or "") or ("call_" + uuid.uuid4().hex[:24]),
@@ -6132,16 +6355,12 @@ def _solo_tool_calls(slots):
     return out
 
 
-def trae_solo_chat(account, payload, timeout=180):
-    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
-
-    This is the portable Trae SOLO channel used by Agent models. It only needs
-    the account access token plus the device identity; no SQLCipher, no AHA,
-    no local Trae CN process.
-    """
+def _solo_headers(account):
+    """SOLO 通道鉴权头（只依赖账号 token + 设备身份）。"""
     token = str(getattr(account, "token", "") or "").strip()
     if not token:
-        raise RuntimeError("account access token is empty")
+        raise SoloUpstreamError("account access token is empty", status=401,
+                                retryable=True)
     uid = str(getattr(account, "uid", "") or "").strip()
     extra = getattr(account, "extra", None) or {}
     try:
@@ -6150,9 +6369,11 @@ def trae_solo_chat(account, payload, timeout=180):
         _fallback_mid = _fp.trae_machine_id(uid)
     except Exception:
         _fallback_dev, _fallback_mid = uid, ""
-    dev = str(extra.get("device_id") or os.environ.get("TRAE_DEVICE_ID") or _fallback_dev).strip()
-    mid = str(extra.get("machine_id") or os.environ.get("TRAE_MACHINE_ID") or _fallback_mid).strip()
-    headers = {
+    dev = str(extra.get("device_id") or os.environ.get("TRAE_DEVICE_ID")
+              or _fallback_dev).strip()
+    mid = str(extra.get("machine_id") or os.environ.get("TRAE_MACHINE_ID")
+              or _fallback_mid).strip()
+    return {
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
         "User-Agent": "Trae/0.1.61 antigravity-cockpit-tools",
@@ -6173,33 +6394,86 @@ def trae_solo_chat(account, payload, timeout=180):
         "X-Device-Brand": "83DG",
         "Request-Traffic-Type": "prod",
     }
+
+
+def _solo_model(payload):
     model = str(payload.get("model") or "deepseek-v4.1-flash").strip()
     model = SOLO_MODEL_ALIASES.get(model, model)
     if model.endswith("-solo"):
         model = model[:-5]
-    messages = _solo_messages(payload)
-    if not messages:
-        raise RuntimeError("messages must not be empty")
+    return model
+
+
+SOLO_CHAT_URL = os.environ.get(
+    "TRAE_SOLO_URL", "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat")
+SOLO_READ_TIMEOUT = float(os.environ.get("TRAE_SOLO_READ_TIMEOUT", "180") or 180)
+
+
+def _solo_body(payload, model, messages, tools):
+    """SOLO 上游 body（字段与官方客户端一致；max_tokens 不再写死 100 万）。"""
+    max_tokens = payload.get("max_tokens")
+    if max_tokens in (None, ""):
+        max_tokens = os.environ.get("TRAE_SOLO_MAX_TOKENS") or 32000
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = 32000
     body = {
         "messages": messages,
         "function": "solo_work_lite",
         "stream": True,
         "config_name": model,
         "model": model,
-        "max_tokens": int(payload.get("max_tokens") or 1000000),
+        "max_tokens": max_tokens,
     }
-    tools = _solo_tools(payload)
     if tools:
         body["tools"] = tools
+    return body
+
+
+def _solo_open(account, body, timeout=None):
+    """打开 SOLO 上游；HTTP 错误转成可分类的 SoloUpstreamError。"""
     req = urllib.request.Request(
-        "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+        SOLO_CHAT_URL,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers=headers, method="POST")
+        headers=_solo_headers(account), method="POST")
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout or SOLO_READ_TIMEOUT)
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode("utf-8", "replace")
-        raise RuntimeError("solo HTTP %s: %s" % (exc.code, detail[:800]))
+        try:
+            detail = exc.read(2000).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        status = int(exc.code)
+        raise SoloUpstreamError(
+            "solo HTTP %s: %s" % (status, detail[:800]), status=status,
+            detail=detail[:800] or ("solo HTTP %s" % status),
+            retryable=status in (401, 403, 429) or status >= 500)
+
+
+def trae_solo_chat(account, payload, timeout=None):
+    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite)。
+
+    This is the portable Trae SOLO channel used by Agent models. It only needs
+    the account access token plus the device identity; no SQLCipher, no AHA,
+    no local Trae CN process.
+
+    真流式：payload 里带 `_on_delta` 回调时，每收到一个上游增量就回调一次
+    （("text", str) / ("reasoning", str) / ("tool", dict) / ("usage", dict) /
+    ("finish", str)），网关据此边收边发；不带回调时返回聚合结果（旧签名不变）。
+    """
+    emit = payload.get("_on_delta") if isinstance(payload, dict) else None
+    if not callable(emit):
+        emit = None
+    model = _solo_model(payload)
+    messages = _solo_messages(payload, strict=False)
+    if not messages:
+        raise SoloUpstreamError("messages must not be empty", status=400,
+                                detail="messages must not be empty",
+                                retryable=False)
+    body = _solo_body(payload, model, messages,
+                      _solo_tools(payload, strict=False))
+    resp = _solo_open(account, body, timeout=timeout)
     text_parts = []
     reasoning_parts = []
     tool_slots = {}
@@ -6211,11 +6485,24 @@ def trae_solo_chat(account, payload, timeout=180):
             if event is None:
                 continue
             if event.get("code") not in (None, 0):
-                raise RuntimeError("solo error %s: %s" % (event.get("code"), event.get("message") or event.get("msg") or ""))
+                raise SoloUpstreamError(
+                    "solo error %s: %s" % (
+                        event.get("code"),
+                        event.get("message") or event.get("msg") or ""),
+                    status=502,
+                    detail="solo error %s: %s" % (
+                        event.get("code"),
+                        event.get("message") or event.get("msg") or ""))
             if event.get("response"):
-                text_parts.append(str(event["response"]))
+                piece = str(event["response"])
+                text_parts.append(piece)
+                if emit:
+                    emit(("text", piece))
             if event.get("reasoning_content"):
-                reasoning_parts.append(str(event["reasoning_content"]))
+                piece = str(event["reasoning_content"])
+                reasoning_parts.append(piece)
+                if emit:
+                    emit(("reasoning", piece))
             # 上游 tool_calls 是增量帧：首帧给 id/name，后续帧只给 arguments 片段
             for call in event.get("tool_calls") or []:
                 if not isinstance(call, dict):
@@ -6224,7 +6511,8 @@ def trae_solo_chat(account, payload, timeout=180):
                     index = int(call.get("index") or 0)
                 except (TypeError, ValueError):
                     index = 0
-                slot = tool_slots.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                slot = tool_slots.setdefault(
+                    index, {"id": "", "name": "", "arguments": ""})
                 if call.get("id"):
                     slot["id"] = str(call["id"])
                 fn = call.get("function_call")
@@ -6234,31 +6522,50 @@ def trae_solo_chat(account, payload, timeout=180):
                     fragment = fn.get("arguments")
                     if isinstance(fragment, str) and fragment:
                         slot["arguments"] += fragment
+                if emit:
+                    emit(("tool", {
+                        "index": index,
+                        "id": str(call.get("id") or ""),
+                        "name": (str(fn.get("name") or "")
+                                 if isinstance(fn, dict) else ""),
+                        "arguments": (str(fn.get("arguments") or "")
+                                      if isinstance(fn, dict) else ""),
+                    }))
             if event.get("finish_reason"):
                 finish_reason = str(event["finish_reason"])
+                if emit:
+                    emit(("finish", finish_reason))
             if "prompt_tokens" in event:
                 usage = {"prompt_tokens": int(event.get("prompt_tokens") or 0),
                          "completion_tokens": int(event.get("completion_tokens") or 0),
                          "total_tokens": int(event.get("total_tokens") or 0)}
+                if emit:
+                    emit(("usage", usage))
     finally:
         try:
             resp.close()
         except Exception:
             pass
     content = "".join(text_parts)
-    tool_calls = _solo_tool_calls(tool_slots)
-    if not content and not tool_calls:
-        raise RuntimeError("solo returned empty content")
+    tool_calls = _solo_tool_calls(tool_slots, strict=False)
+    if tool_calls and finish_reason not in ("stop", "tool_calls"):
+        # 上游在工具调用没走完就结束（长度截断 / 内容过滤）：这些调用不可执行，
+        # 丢掉它们并把终止原因原样交给客户端，绝不包装成可执行的 tool_calls。
+        log("solo: dropped %d incomplete tool_call(s) on finish_reason=%s"
+            % (len(tool_calls), finish_reason), level="WARN", tag="chat")
+        tool_calls = []
     if tool_calls:
-        # 上游若在工具调用没走完就结束（长度截断 / 内容过滤 / 其它失败终止），
-        # 这些 tool_calls 不可执行，不能包装成 finish_reason=tool_calls 给下游。
-        if finish_reason not in ("stop", "tool_calls"):
-            raise RuntimeError("solo 终止原因 %s，tool_calls 可能不完整，拒绝返回" % finish_reason)
         finish_reason = "tool_calls"
+    if not content and not tool_calls:
+        # 不抛错：空正文是上游的正常（虽然少见）结果，交给客户端按空回复处理，
+        # 比把整次请求变成 502 更稳定。
+        log("solo: upstream returned empty content (finish=%s)" % finish_reason,
+            level="WARN", tag="chat")
     return {"content": content, "reasoning": "".join(reasoning_parts),
             "tool_calls": tool_calls,
             "finish_reason": finish_reason, "usage": usage,
             "model": model}
+
 
 def trae_open_chat(account, realm, body, host=None, timeout=600):
     """打开一次 llm_raw_chat（始终流式返回 SSE，协议 §六）。"""
@@ -7594,11 +7901,15 @@ def pool_guard(account, model, realm, tokens=0):
     return bool(result), "", ""
 
 
-def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
+                  pinned_uid=None):
     """构造 Trae 请求体并打开上游 SSE。返回 (resp, account, body_bytes)。
 
     usage_ctx：可选**出参** dict，回填推理档位审计信息（effort_requested =
     客户端原值；effort = 实际下发的档位；realm = 实际出口）。
+
+    pinned_uid：只允许该账号（账号测试用）。默认 None = 正常池化选号；固定账号
+    失败时**不换号**，否则「测试 A 号」实际测的是 B 号，失败原因也会记到错的人头上。
 
     账号轮换规则（PROTOCOL §六 / §11.4，code 语义由 trae_accounts.note_error 定义）：
       · 1001 / HTTP 401/403：先刷新 token 原地重试一次，仍失败 -> breaker 换号
@@ -7618,6 +7929,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 % (realm, CURRENT_REALM, model), tag="realm")
             if usage_ctx is not None:
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
+    pinned = None
+    if pinned_uid:
+        pinned = POOL.get(str(pinned_uid)) if POOL else None
+        if pinned is None:
+            raise UpstreamStatus(404, "account not found: %s" % pinned_uid)
+        # 固定账号时出口以该账号为准（账号测试不应被自动换区改掉）
+        realm = trae_realm(getattr(pinned, "realm", "") or realm)
     model_key = trae_catalog.resolve_upstream_key(model, realm=realm)
 
     # 请求体与账号无关（鉴权在头上），构造一次即可
@@ -7646,10 +7964,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     waited_cool = False
 
     for _ in range(total + 2):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+        if pinned is not None:
+            account = None if pinned.uid in tried else pinned
+        else:
+            account = POOL.pick_for_session(
+                realm=realm, session_key=session_key,
+                exclude=tried, model=model) if POOL else None
         if account is None:
-            if not waited_cool:
+            if pinned is None and not waited_cool:
                 wait = _short_error_cooldown_wait(realm, model, exclude=tried)
                 if wait > 0:
                     waited_cool = True
@@ -7838,7 +8160,8 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
     source     : 上游数据迭代器（iter_inner_sse 的输出，产出 bytes）
     send       : 发送函数（接收 bytes）
     interval   : 空闲多久发一次心跳（秒），默认 5（可用 QD_SSE_HEARTBEAT 覆盖）
-    idle_limit : 单次等待上限（秒），默认 900；超过抛 TimeoutError
+    idle_limit : 单次等待上限（秒），默认 300（可用 QD_SSE_IDLE_LIMIT 覆盖）；
+                 超过抛 TimeoutError，由调用方转成明确的 504 错误帧
 
     读线程把上游数据放入队列，主线程只在“队列空闲”时补心跳，保证顺序与
     错误传播（上游异常原样在主线程抛出）。
@@ -7854,7 +8177,10 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
             yield item
         return
     if idle_limit is None:
-        idle_limit = 900.0
+        try:
+            idle_limit = float(os.environ.get("QD_SSE_IDLE_LIMIT", "300") or 300)
+        except Exception:
+            idle_limit = 300.0
 
     import queue as _queue
     import threading as _threading
@@ -9156,6 +9482,23 @@ class Handler(BaseHTTPRequestHandler):
         super(Handler, self).handle_one_request()
         self._drain_request_body()
 
+    def log_error(self, fmt, *args):
+        """Suppress the benign keep-alive idle-timeout line from http.server.
+
+        `Request timed out: TimeoutError('timed out')` comes from stdlib's
+        handle_one_request(): a keep-alive connection sat idle past `timeout`
+        (30s) waiting for the next request line. No request was lost - the
+        socket is simply closed. It is not an upstream/Trae timeout.
+        Everything else still goes to the normal error log.
+        """
+        try:
+            message = fmt % args if args else str(fmt)
+        except Exception:
+            message = str(fmt)
+        if "Request timed out" in message:
+            return
+        super(Handler, self).log_error(fmt, *args)
+
     def _drain_request_body(self):
         """Consume any unread request body, else close the connection.
 
@@ -9301,6 +9644,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         self._chunked = False
+
+    def _sse_safe_error(self, message, status=502):
+        """流内错误收尾：写错误帧 + [DONE]，写失败（客户端已断）也不抛。"""
+        try:
+            self._sse_write(_solo_error_frame(message, status))
+            self._sse_write(b"data: [DONE]\n\n")
+        except Exception:
+            pass
+        self._sse_end()
 
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -9783,18 +10135,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     def _admin_test_account(self, account):
-        model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
-        started = time.time()
-        try:
-            response, used, _ = open_upstream({"model": model, "max_tokens": 32,
-                "messages": [{"role": "user", "content": "hi"}]},
-                target_realm=acc_realm(account))
-            with response:
-                obj = aggregate_stream(response, model, None)
-            return {"ok": True, "model": model, "elapsed_ms": int((time.time()-started)*1000)}
-        except Exception as error:
-            detail = str(error)
-            return {"ok": False, "model": model, "error": detail[:300]}
+        probe = _account_probe(account)
+        if probe["ok"]:
+            return {"ok": True, "model": probe["model"],
+                    "elapsed_ms": probe["elapsed_ms"],
+                    "reply": probe["reply"][:80]}
+        return {"ok": False, "model": probe["model"],
+                "error": probe["error"][:300],
+                "status": probe["status"],
+                "elapsed_ms": probe["elapsed_ms"]}
 
     def _handle_admin(self, path, payload):
         if not isinstance(payload, dict):
@@ -10649,52 +10998,270 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "token": token})
         return self._error(404, "not found", "invalid_request_error")
 
+    def _solo_pump(self, run, on_event, ensure_stream, stream_state):
+        """在后台线程跑一次 SOLO 调用，主线程边收边发（空闲补 SSE 心跳）。
+
+        上游异常在主线程原样抛出。关键点：
+          · 首字节之前**不**打开 SSE —— 这样上游直接失败时仍能回正常的 4xx/5xx
+            JSON，而不是先 200 再报错；
+          · 首字节之后才开流，此后空闲按 TRAE_SSE_HEARTBEAT 补 `: ping`，
+            长回答期间客户端不会因为「一直没有字节」而超时断开。
+        """
+        try:
+            interval = float(os.environ.get("TRAE_SSE_HEARTBEAT", "5") or 5)
+        except Exception:
+            interval = 5.0
+        try:
+            idle_limit = float(os.environ.get("TRAE_SOLO_IDLE_LIMIT", "300") or 300)
+        except Exception:
+            idle_limit = 300.0
+        try:
+            first_limit = float(os.environ.get(
+                "TRAE_SOLO_FIRST_BYTE_LIMIT", "180") or 180)
+        except Exception:
+            first_limit = 180.0
+        if interval <= 0:
+            ensure_stream()
+            return run(on_event)
+
+        import queue as _queue
+        box = _queue.Queue()
+        outcome = {}
+
+        def worker():
+            try:
+                outcome["value"] = run(lambda ev: box.put(("ev", ev)))
+            except BaseException as exc:          # noqa: BLE001
+                outcome["error"] = exc
+            finally:
+                box.put(("done", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+        waited = 0.0
+        while True:
+            try:
+                kind, value = box.get(timeout=interval)
+            except _queue.Empty:
+                waited += interval
+                if stream_state.get("started"):
+                    if waited >= idle_limit:
+                        raise TimeoutError(
+                            "solo upstream produced no data for %.0fs" % waited)
+                    self._sse_write(b": ping\n\n")
+                elif waited >= first_limit:
+                    raise TimeoutError(
+                        "solo upstream sent nothing for %.0fs" % waited)
+                continue
+            waited = 0.0
+            if kind == "done":
+                break
+            if kind == "ev":
+                ensure_stream()
+                on_event(value)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("value")
+
     def _handle_agent_solo(self, payload):
         model = str(payload.get("model") or "deepseek-v4.1-flash")
+        # SOLO 上游只有国内版出口：显式要求国际版时直接说明，不静默换区。
+        try:
+            explicit = self._request_realm()
+        except Exception:
+            explicit = None
+        if explicit and trae_realm(explicit) != "cn":
+            return self._error(
+                400,
+                "SOLO/Agent 通道只提供国内版(CN)出口，当前请求指定的是 %s。"
+                "请改用国内版 Key / ?realm=cn，或换一个非 SOLO 模型。"
+                % trae_realm(explicit),
+                "invalid_request_error")
         blocked = self._model_precheck(model, "cn")
         if blocked:
-            return self._error(getattr(self, "_precheck_status", 400), blocked, "invalid_request_error")
+            return self._error(getattr(self, "_precheck_status", 400), blocked,
+                               "invalid_request_error")
         try:
             enforce_model_context(payload, model, "cn")
         except UpstreamStatus as exc:
             return self._error(exc.status, exc.detail, "invalid_request_error")
-        account = POOL.pick(realm="cn") if POOL else None
-        if not account:
-            return self._error(503, "no CN account available", "server_error")
+
+        want_stream = bool(payload.get("stream"))
         started = time.monotonic()
         request_id = uuid.uuid4().hex
-        try:
-            result = trae_solo_chat(account, {**payload, "model": model})
-        except Exception as exc:
-            record_error(model, 502, str(exc)[:200],
-                         elapsed_ms=int((time.monotonic()-started)*1000))
-            return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
-        record_usage(model, result.get("usage"), stream=bool(payload.get("stream")),
-                     elapsed_ms=int((time.monotonic()-started)*1000),
-                     account=account.uid, key_id=self._key_id_for_usage(),
-                     fp=prompt_fingerprint(payload.get("messages")), request_id=request_id)
+        fp = prompt_fingerprint(payload.get("messages"))
+        self.realm_used = "cn"
+        self.realm_reason = ""
+        chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+
+        def chunk(delta, finish=None, usage=None):
+            frame = {"id": chunk_id, "object": "chat.completion.chunk",
+                     "created": created, "model": model, "choices": []}
+            if delta is not None:
+                frame["choices"] = [{"index": 0, "delta": delta,
+                                     "finish_reason": finish}]
+            if usage:
+                frame["usage"] = usage
+            return ("data: " + json.dumps(frame, ensure_ascii=False)
+                    + "\n\n").encode("utf-8")
+
+        stream_state = {"started": False, "body": False}
+
+        def ensure_stream():
+            if not stream_state["started"]:
+                self._sse_begin()
+                stream_state["started"] = True
+                self._sse_write(chunk({"role": "assistant", "content": ""}))
+
+        def emit_frame(event):
+            kind, value = event
+            if kind == "text":
+                if value:
+                    stream_state["body"] = True
+                    self._sse_write(chunk({"content": value}))
+            elif kind == "reasoning":
+                if value:
+                    stream_state["body"] = True
+                    self._sse_write(chunk({"reasoning_content": value}))
+            elif kind == "tool":
+                call = {"index": value.get("index") or 0, "type": "function",
+                        "function": {}}
+                if value.get("id"):
+                    call["id"] = value["id"]
+                if value.get("name"):
+                    call["function"]["name"] = value["name"]
+                if value.get("arguments"):
+                    call["function"]["arguments"] = value["arguments"]
+                if call["function"]:
+                    stream_state["body"] = True
+                    self._sse_write(chunk({"tool_calls": [call]}))
+            # usage / finish 统一在收尾时补发（严格客户端只接受收尾 usage 帧）
+
+        total = _solo_ready_total("cn", model)
+        tried = set()
+        refreshed = set()
+        last_exc = None
+        account = None
+        result = None
+
+        for _attempt in range(total + 1):
+            acc = POOL.pick(realm="cn", exclude=tried, model=model) if POOL else None
+            if acc is None:
+                break
+            tried.add(acc.uid)
+            if trae_token_expired(acc):
+                trae_refresh_account(acc, "cn")
+            call_payload = dict(payload, model=model)
+            try:
+                if want_stream:
+                    result = self._solo_pump(
+                        lambda emit: trae_solo_chat(
+                            acc, dict(call_payload, _on_delta=emit)),
+                        emit_frame, ensure_stream, stream_state)
+                else:
+                    result = trae_solo_chat(acc, call_payload)
+                account = acc
+                try:
+                    acc.note_success(model=model)
+                except Exception:
+                    pass
+                break
+            except Exception as exc:
+                last_exc = exc
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                                    ConnectionAbortedError)):
+                    # 客户端断开：上游已产出的部分照常记账，不再尝试写任何帧。
+                    try:
+                        record_usage(
+                            model, None, stream=True,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            account=acc.uid,
+                            key_id=self._key_id_for_usage(),
+                            fp=fp, request_id=request_id)
+                    except Exception:
+                        pass
+                    return
+                status, detail, retryable = _solo_error_info(exc)
+                if status in (400, 4023) or not retryable:
+                    # 参数/模型/上下文问题：换号也没用，直接回给客户端
+                    record_error(model, status, detail,
+                                 elapsed_ms=int((time.monotonic() - started) * 1000),
+                                 stream=want_stream)
+                    if stream_state["started"]:
+                        self._sse_safe_error(detail, status)
+                        return
+                    return self._error(status, detail, "invalid_request_error")
+                if status in (401, 403) and acc.uid not in refreshed:
+                    refreshed.add(acc.uid)
+                    if trae_refresh_account(acc, "cn", force=True):
+                        tried.discard(acc.uid)      # 刷新成功：原地再试一次
+                        continue
+                _solo_note_failure(acc, status, detail, total)
+                if stream_state["body"]:
+                    # 已经发过正文：换号重放会重复内容，明确收尾优于留下半截流。
+                    record_error(model, status, detail,
+                                 elapsed_ms=int((time.monotonic() - started) * 1000),
+                                 stream=True)
+                    self._sse_safe_error(detail, status)
+                    return
+                continue
+
+        if account is None:
+            if last_exc is not None:
+                status, detail, _ = _solo_error_info(last_exc)
+            else:
+                status, detail = 503, "no CN account available"
+            record_error(model, status, detail,
+                         elapsed_ms=int((time.monotonic() - started) * 1000),
+                         stream=want_stream)
+            if want_stream and stream_state["started"]:
+                self._sse_safe_error(detail, status)
+                return
+            if status == 503:
+                return self._error(503, "no CN account available", "server_error")
+            return self._error(status, "Trae SOLO upstream failed: %s" % detail,
+                               "upstream_error")
+
+        result = result or {}
         tool_calls = result.get("tool_calls") or []
-        if payload.get("stream"):
-            self._sse_begin()
-            cid = "chatcmpl-" + uuid.uuid4().hex
-            delta = {"role": "assistant", "content": result["content"] or None}
-            if tool_calls:
-                delta["tool_calls"] = [
-                    {"index": i, "id": call["id"], "type": "function",
-                     "function": {"name": call["function"]["name"],
-                                  "arguments": call["function"]["arguments"]}}
-                    for i, call in enumerate(tool_calls)]
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-            self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}]}
-            self._sse_write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            self._sse_write(b"data: [DONE]\n\n")
-            self._sse_end()
+        content = result.get("content") or ""
+        reasoning = result.get("reasoning") or ""
+        finish = result.get("finish_reason") or (
+            "tool_calls" if tool_calls else "stop")
+        usage = result.get("usage")
+
+        record_usage(model, usage, stream=want_stream,
+                     elapsed_ms=int((time.monotonic() - started) * 1000),
+                     account=account.uid, key_id=self._key_id_for_usage(),
+                     fp=fp, request_id=request_id)
+
+        if want_stream:
+            try:
+                ensure_stream()
+                if not stream_state["body"]:
+                    # 上游没有回调增量（或调用方 mock 直接返回聚合结果）：补发正文。
+                    if reasoning:
+                        self._sse_write(chunk({"reasoning_content": reasoning}))
+                    if content:
+                        self._sse_write(chunk({"content": content}))
+                    if tool_calls:
+                        self._sse_write(chunk({"tool_calls": [
+                            {"index": i, "id": call["id"], "type": "function",
+                             "function": {"name": call["function"]["name"],
+                                          "arguments": call["function"]["arguments"]}}
+                            for i, call in enumerate(tool_calls)]}))
+                self._sse_write(chunk({}, finish=finish))
+                if usage:
+                    self._sse_write(chunk(None, usage=usage))
+                self._sse_write(b"data: [DONE]\n\n")
+                self._sse_end()
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError):
+                pass
             return
-        message = {"role": "assistant", "content": result["content"] or None,
-                   "reasoning_content": result["reasoning"]}
+
+        message = {"role": "assistant", "content": content or None,
+                   "reasoning_content": reasoning}
         if tool_calls:
             message["tool_calls"] = [
                 {"id": call["id"], "type": "function",
@@ -10702,12 +11269,14 @@ class Handler(BaseHTTPRequestHandler):
                               "arguments": call["function"]["arguments"]}}
                 for call in tool_calls]
         return self._json(200, {
-            "id": "chatcmpl-" + uuid.uuid4().hex,
+            "id": chunk_id,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": created,
             "model": model,
-            "choices": [{"index": 0, "message": message, "finish_reason": result["finish_reason"]}],
-            "usage": result["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": finish}],
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0,
+                               "total_tokens": 0},
         })
 
     def _handle_agent_ui(self, payload):
@@ -11051,26 +11620,11 @@ class Handler(BaseHTTPRequestHandler):
             account = POOL.get(uid)
             if not account:
                 return self._error(404, "no such account")
-            test_model = payload.get("model") or "auto"
-            if str(test_model).strip().lower() == "auto":
-                # `/accounts/test` uses the raw_chat upstream; `auto` is not a
-                # raw model and always returns upstream 400. Pick a real model.
-                test_model = "Doubao-1.5-pro" if acc_realm(account) == "cn" else "gpt-4o"
-            test_payload = {
-                "model": test_model,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-            }
-            t0 = time.time()
-            try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
-                with resp:
-                    chat_obj = aggregate_stream(resp, test_model, None)
-                wall_ms = int((time.time() - t0) * 1000)
-                choices = chat_obj.get("choices") or []
-                msg = (choices[0].get("message") or {}) if choices else {}
-                reply_text = (msg.get("content") or msg.get("reasoning_content")
-                              or "OK").strip()
+            probe = _account_probe(account, payload.get("model"))
+            test_model = probe["model"]
+            wall_ms = probe["elapsed_ms"]
+            if probe["ok"]:
+                reply_text = probe["reply"]
                 if len(reply_text) > 80:
                     reply_text = reply_text[:77] + "..."
                 account.clear_error()
@@ -11080,37 +11634,18 @@ class Handler(BaseHTTPRequestHandler):
                                         "model": test_model,
                                         "elapsed_ms": wall_ms,
                                         "reply": reply_text})
-            except RateLimited as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 429,
-                                        "error": "rate limited: %s" % exc.detail[:150],
-                                        "elapsed_ms": wall_ms})
-            except urllib.error.HTTPError as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                try:
-                    detail = exc.read(400).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-                account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
-                                   cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms error=%d"
-                    % (account.uid[:8], test_model, wall_ms, exc.code),
-                    level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": exc.code,
-                                        "error": "HTTP %d: %s"
-                                        % (exc.code, detail[:150]),
-                                        "elapsed_ms": wall_ms})
-            except Exception as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                account.note_error(str(exc)[:80], cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms exc=%s"
-                    % (account.uid[:8], test_model, wall_ms, exc),
-                    level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 500, "error": str(exc),
-                                        "elapsed_ms": wall_ms})
+            # 失败：按可分类的状态码回给面板，并把上游 detail 一并带上，
+            # 否则只会看到一句「upstream status 400」而无从排障。
+            status = probe["status"]
+            if status != 429:
+                account.note_error(str(probe["error"])[:80], cooldown=60)
+            log("account test: uid=%s model=%s wall=%dms status=%s error=%s"
+                % (account.uid[:8], test_model, wall_ms, status,
+                   str(probe["error"])[:200]), level="WARN", tag="accounts")
+            return self._json(200, {"ok": False, "uid": account.uid,
+                                    "model": test_model, "status": status,
+                                    "error": str(probe["error"])[:300],
+                                    "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
@@ -11495,6 +12030,17 @@ class Handler(BaseHTTPRequestHandler):
                                 cur = cur2
                                 continue
                             pump_exc = exc
+                            break
+                        except TimeoutError as exc:
+                            # 上游长时间无字节：明确收尾，绝不把连接吊到客户端超时。
+                            pump_exc = UpstreamStatus(
+                                504, "upstream idle timeout: %s" % exc)
+                            break
+                        except Exception as exc:
+                            # 任何未预期异常都要变成可读的错误帧 + [DONE]，
+                            # 否则连接被直接断开，客户端表现为「卡死/断流」。
+                            pump_exc = UpstreamStatus(
+                                502, "upstream stream error: %s" % str(exc)[:200])
                             break
                 finally:
                     if cur is not upstream:
@@ -11913,6 +12459,17 @@ class Handler(BaseHTTPRequestHandler):
                                 continue
                             pump_exc = exc
                             break
+                        except TimeoutError as exc:
+                            # 上游长时间无字节：明确收尾，绝不把连接吊到客户端超时。
+                            pump_exc = UpstreamStatus(
+                                504, "upstream idle timeout: %s" % exc)
+                            break
+                        except Exception as exc:
+                            # 任何未预期异常都要变成可读的错误帧 + [DONE]，
+                            # 否则连接被直接断开，客户端表现为「卡死/断流」。
+                            pump_exc = UpstreamStatus(
+                                502, "upstream stream error: %s" % str(exc)[:200])
+                            break
                 finally:
                     if cur is not upstream:
                         try:
@@ -11990,6 +12547,93 @@ class Handler(BaseHTTPRequestHandler):
 
 def acc_realm(account):
     return account.realm if account else CURRENT_REALM
+
+
+def _account_test_model(realm, override=None):
+    """账号测试用模型：必须真实存在于该区目录，否则上游 4023 会被误判成账号故障。
+
+    旧实现写死 Doubao-1.5-pro / gpt-4o —— 这两个名字在当前官方目录里已经不存在，
+    健康账号也会被测试成失败。这里从目录里挑第一个可聊的模型，写死值只做兜底。
+    """
+    if override and str(override).strip().lower() != "auto":
+        return str(override).strip()
+    try:
+        keys = [str(row.get("key") or "").strip()
+                for row in trae_catalog.models_for_realm(realm)
+                if row.get("enable") is not False]
+    except Exception:
+        keys = []
+    # 优先用便宜、通用的模型，避免每次「测试账号」都跑最贵的那个
+    preferred = {
+        "cn": ("deepseek-v4.1-flash", "glm-5.3-flash", "Doubao-Seed-2.1-Turbo"),
+        "intl": ("gemini-2.5-pro-latest", "gemini-2.5-flash-latest",
+                 "gpt-5.5"),
+    }.get(realm, ())
+    for cand in preferred:
+        if cand in keys and is_chat_model(cand):
+            return cand
+    for key in keys:
+        if key and is_chat_model(key):
+            return key
+    # 兜底也必须是「该区真实可发车」的通道：CN 目录已全量 SOLO，
+    # 拿 CN 模型去打 raw_chat 只会得到 400。
+    return "deepseek-v4.1-flash" if realm == "cn" else "gemini-2.5-pro-latest"
+
+
+def _account_probe(account, model=None):
+    """用指定账号跑一次最小请求，按模型自动选 SOLO / raw_chat 通道。
+
+    返回 dict：{ok, model, reply, error, status, elapsed_ms}。**只测这一个账号**：
+    SOLO 直接调用该账号；raw_chat 用 pinned_uid 固定，失败不换号——
+    否则「测试 A 号」可能实际测的是 B 号。
+    """
+    realm = acc_realm(account)
+    model = _account_test_model(realm, model)
+    payload = {"model": model, "stream": False, "max_tokens": 64,
+               "messages": [{"role": "user", "content": "hi"}]}
+    started = time.time()
+
+    def done(ok, reply="", error="", status=200):
+        return {"ok": ok, "model": model, "reply": reply,
+                "error": error, "status": status,
+                "elapsed_ms": int((time.time() - started) * 1000)}
+
+    try:
+        if model in SOLO_AGENT_MODELS:
+            if trae_token_expired(account):
+                trae_refresh_account(account, realm)
+            try:
+                result = trae_solo_chat(account, payload) or {}
+            except Exception as exc:
+                status, _detail, _retry = _solo_error_info(exc)
+                # 与真实 chat 一致：鉴权失败先刷新 token 再判死
+                if status in (401, 403) and trae_refresh_account(
+                        account, realm, force=True):
+                    result = trae_solo_chat(account, payload) or {}
+                else:
+                    raise
+            reply = (result.get("content") or result.get("reasoning")
+                     or "OK").strip()
+        else:
+            resp, _acc, _ = open_upstream(
+                payload, target_realm=realm, pinned_uid=account.uid)
+            with resp:
+                chat_obj = aggregate_stream(resp, model, None)
+            choices = chat_obj.get("choices") or []
+            msg = (choices[0].get("message") or {}) if choices else {}
+            reply = (msg.get("content") or msg.get("reasoning_content")
+                     or "OK").strip()
+        return done(True, reply=reply)
+    except Exception as exc:
+        detail = getattr(exc, "detail", "") or str(exc)
+        try:
+            status = int(getattr(exc, "status", 0) or 0)
+        except Exception:
+            status = 0
+        if not status:
+            m = re.search(r"status (\d{3})", str(exc))
+            status = int(m.group(1)) if m else 500
+        return done(False, error=detail, status=status)
 
 
 def main():

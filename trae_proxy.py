@@ -409,6 +409,76 @@ def install_console_close_handler():
         return None
 
 
+def disable_console_quick_edit():
+    """Stop a stray click in the console window from freezing the gateway.
+
+    Windows conhost ships with QuickEdit enabled: a single click (or drag)
+    inside the window starts a text selection, and while a selection is
+    active the console stops consuming output. The next write to
+    stdout/stderr blocks inside WriteConsole - not for milliseconds, but
+    until the selection is cleared (Esc, or Ctrl+C, which QuickEdit handles
+    as "copy selection" and therefore does *not* raise KeyboardInterrupt).
+
+    This gateway logs synchronously from the thread that is doing the work:
+    the main thread during startup (account pool load) and every request
+    handler while it serves the panel. The account pool even logs while it
+    holds its own lock. So one accidental click freezes startup ("accounts
+    never finish loading") and every in-flight panel request ("the request
+    hangs until I press Ctrl+C").
+
+    Clearing ENABLE_QUICK_EDIT_MODE removes the trap. ENABLE_EXTENDED_FLAGS
+    must stay set for the change to take effect. Set TRAE_KEEP_QUICK_EDIT=1
+    to keep mouse selection (and accept the freeze risk) on purpose.
+    """
+    if os.name != "nt" or os.environ.get("TRAE_KEEP_QUICK_EDIT") == "1":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        opened = None
+        handle = kernel32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        mode = wintypes.DWORD()
+        if not handle or not kernel32.GetConsoleMode(handle,
+                                                     ctypes.byref(mode)):
+            # stdin 被重定向（< nul、管道、IDE）时拿不到控制台模式；
+            # 直接开 CONIN$，这样仍然能改窗口的输入模式。
+            GENERIC_READ, GENERIC_WRITE = 0x80000000, 0x40000000
+            OPEN_EXISTING = 3
+            opened = kernel32.CreateFileW(
+                "CONIN$", GENERIC_READ | GENERIC_WRITE,
+                0x00000001 | 0x00000002,          # FILE_SHARE_READ|WRITE
+                None, OPEN_EXISTING, 0, None)
+            if not opened or opened == wintypes.HANDLE(-1).value:
+                return False
+            handle = opened
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.CloseHandle(handle)
+                return False
+        try:
+            # 0x0080 = ENABLE_EXTENDED_FLAGS, 0x0040 = ENABLE_QUICK_EDIT_MODE
+            new_mode = (mode.value | 0x0080) & ~0x0040
+            if new_mode == mode.value:
+                return False
+            return bool(kernel32.SetConsoleMode(handle, new_mode))
+        finally:
+            if opened:
+                kernel32.CloseHandle(opened)
+    except Exception:
+        return False
+
+
 # Launcher names differ per platform; the messages below are read by whoever
 # is staring at the terminal, so point at the file that actually exists there.
 IS_WINDOWS = os.name == "nt"
@@ -3382,9 +3452,16 @@ def add_log_entry(msg, level=None, tag=None):
 
 
 def log(msg, level=None, tag=None):
-    sys.stderr.write("[trae2api] %s %s\n" % (time.strftime("%H:%M:%S"), msg))
-    sys.stderr.flush()
-    add_log_entry(msg, level=level, tag=tag)
+    # 先进看板缓冲区再写控制台：控制台被关闭、句柄失效或（快速编辑选中时）
+    # 写入阻塞，都不该让业务线程丢失日志或直接抛异常。
+    entry = add_log_entry(msg, level=level, tag=tag)
+    try:
+        sys.stderr.write("[trae2api] %s %s\n"
+                         % (time.strftime("%H:%M:%S"), msg))
+        sys.stderr.flush()
+    except Exception:
+        pass
+    return entry
 
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
@@ -13253,6 +13330,9 @@ def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
         USAGE_SUMMARY, SCHEDULER
     API_KEY_GENERATED = False
+    # 必须在第一条日志之前：Windows 控制台开启快速编辑时，鼠标选中文本会让
+    # stdout/stderr 的写入阻塞，进程表现为“启动卡住 / 请求卡住，按 Ctrl+C 才继续”。
+    disable_console_quick_edit()
     ap = argparse.ArgumentParser(
         description="Trae (trae.com.cn / trae.ai) -> OpenAI-compatible proxy")
     ap.add_argument("--host", default=os.environ.get("HOST") or "127.0.0.1")

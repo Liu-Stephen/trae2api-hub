@@ -8575,11 +8575,13 @@ function creditSplitCell(r){
   const cacheTxt = cachedKnown ? fmtPart(sp.cached)
     : '<span style="color:var(--dim)" title="上游没有回报缓存字段，缓存段无法折算">?</span>';
   const nominal = (r.billable === false);
+  const estimated = !!r.credit_split_estimated || !!r.credit_estimated;
   const style = nominal ? 'opacity:.62;font-style:italic' : '';
   return '<span style="' + style + '" title="' + esc(
-      (nominal ? '名义成本（上游标记为不计费）' : '实际扣费') +
+      (nominal ? '名义成本（上游标记为不计费）' : (estimated ? '估算拆分（上游未返回单请求积分，按账户实际消耗 × 三段等价花费占比）' : '实际扣费')) +
       '：非缓存输入 ' + (sp.input || 0) + ' + 缓存输入 ' + (sp.cached || 0) +
       ' + 输出 ' + (sp.output || 0) + ' = ' + total.toFixed(2) + ' 积分') + '">'
+    + (estimated ? '<span style="color:var(--dim);margin-right:2px">≈</span>' : '')
     + '<span style="color:#e08b2b">' + fmtPart(sp.input) + '</span>'
     + '<span style="color:var(--dim)">+</span>' + '<span style="color:#26bb82">' + cacheTxt + '</span>'
     + '<span style="color:var(--dim)">+</span>' + '<span style="color:var(--think)">' + fmtPart(sp.output) + '</span>'
@@ -8591,6 +8593,7 @@ function creditCell(r){
   if(r.error) return '<span style="color:var(--dim)">—</span>';
   const c = Number(r.credit || 0);
   const orig = Number(r.original_credits || 0);
+  const estimated = !!r.credit_estimated;
   if(!c && !orig) return '<span style="color:var(--dim)">0</span>';
   const shown = (c || orig);
   const txt = shown >= 100 ? shown.toFixed(0) : shown.toFixed(2);
@@ -8600,23 +8603,30 @@ function creditCell(r){
       + (orig >= 100 ? orig.toFixed(0) : orig.toFixed(2)) + '</span>'
     : '';
   const color = shown >= 100 ? 'color:#e08b2b' : 'color:var(--accent2)';
-  return '<b style="' + color + '">' + txt + '</b>' + disc;
+  const title = estimated
+    ? '按账户实际消耗估算（上游未返回单请求积分）'
+    : '上游返回的单请求扣费';
+  return '<b style="' + color + '" title="' + esc(title) + '">'
+    + (estimated ? '≈' : '') + txt + '</b>' + disc;
 }
 
 function creditTitle(r){
   const c = Number(r.credit || 0), orig = Number(r.original_credits || 0);
-  const parts = ['本次扣费 ' + c + ' 积分'];
+  const parts = [r.credit_estimated
+    ? ('本次估算扣费 ≈' + c + ' 积分（按账户实际消耗 × 等价花费占比折算）')
+    : ('本次扣费 ' + c + ' 积分')];
   if(orig > c + 1e-9) parts.push('原价 ' + orig + '（当前有折扣/谷时价）');
   if(r.billable === false) parts.push('上游标记为不计费');
   return parts.join(' · ');
 }
 
 function recentCreditSummary(rows){
-  let sum = 0, sumOrig = 0, n = 0;
+  let sum = 0, sumOrig = 0, n = 0, estimated = false;
   (rows || []).forEach(function(r){
     if(r.error) return;
     const c = Number(r.credit || 0), o = Number(r.original_credits || 0);
     sum += c; sumOrig += (o > c ? o : c); n += 1;
+    if(r.credit_estimated) estimated = true;
   });
   if(!n) return '';
   const disc = sumOrig > sum + 1e-9
@@ -8637,8 +8647,9 @@ function recentCreditSummary(rows){
     + ' <span style="color:var(--dim)">+</span> '
     + '<span style="color:var(--think)">输出 ' + part.output.toFixed(1) + '</span>';
   return '<div class="legend" style="margin-top:6px"><span>本页 ' + n + ' 次调用合计 '
-    + '<b style="color:var(--accent2)">' + sum.toFixed(2) + '</b> 积分' + disc
+    + '<b style="color:var(--accent2)">' + (estimated ? '≈' : '') + sum.toFixed(2) + '</b> 积分' + disc
     + '（拆分：' + splitTxt + '）'
+    + (estimated ? '<span style="color:var(--dim)"> · 含估算值（上游未返回单请求积分）</span>' : '')
     + '；单次扣费按积分列（鼠标悬停看明细）</span></div>';
 }
 

@@ -5,6 +5,7 @@
   [1] 成功（usage=None，非流式）：record_usage 被调用且带 request uuid；
       requests+1；usage_missing=True（不伪造 0 命中）
   [2] 成功（流式 SSE）：同样记账 requests+1，[DONE] 正常收尾
+  [2b] 首字/速度/缓存：ttft_ms、gen_ms、tokens_per_sec、cache_hit_pct 落盘
   [3] 相同提示连发两次：两条 usage 行、两个不同 request_id（不误去重）
   [4] 上游失败：record_error 一次（502），不产生 usage 行，errors+1
   [5] 禁用账号不可回退：池里只有 disabled 账号 -> 503，且不调用上游
@@ -183,7 +184,9 @@ def main():
     def spy_usage(model, usage=None, **kw):
         usage_calls.append({"model": model, "usage": usage,
                             "request_id": kw.get("request_id"),
-                            "stream": kw.get("stream")})
+                            "stream": kw.get("stream"),
+                            "ttft_ms": kw.get("ttft_ms"),
+                            "gen_ms": kw.get("gen_ms")})
         return saved_record_usage(model, usage, **kw)
 
     def spy_error(model, status, message, **kw):
@@ -256,6 +259,47 @@ def main():
               rows[-1].get("usage_missing") is True, rows[-1])
 
         # ---------------------------------------------------------------
+        section("[2b] 首字 / 速度 / 缓存：增量计时与 token_usage 细分")
+        def fake_solo_usage(account, payload):
+            emit = payload.get("_on_delta")
+            time.sleep(0.02)
+            if emit:
+                emit(("text", "solo-ok"))
+            time.sleep(0.02)
+            if emit:
+                emit(("usage", {"prompt_tokens": 100, "completion_tokens": 10,
+                                "total_tokens": 110,
+                                "cache_read_input_tokens": 40}))
+            return {"content": "solo-ok", "reasoning": "", "tool_calls": [],
+                    "finish_reason": "stop",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                              "total_tokens": 110,
+                              "cache_read_input_tokens": 40}}
+
+        P.trae_solo_chat = fake_solo_usage
+        try:
+            code, _body = http.post("/v1/agent/chat",
+                                    dict(base_payload, stream=True))
+            check("带 usage 的流式 -> 200", code == 200, code)
+            call = usage_calls[-1] if usage_calls else {}
+            check("record_usage 带 ttft_ms（非 null）",
+                  isinstance(call.get("ttft_ms"), int), call)
+            check("record_usage 带 gen_ms（非 null）",
+                  isinstance(call.get("gen_ms"), int) and call["gen_ms"] > 0,
+                  call)
+            row = [r for r in read_rows(P.USAGE_LOG)
+                   if r.get("model") == MODEL][-1]
+            check("行内 ttft_ms 落盘", isinstance(row.get("ttft_ms"), int), row)
+            check("行内 tokens_per_sec 落盘",
+                  isinstance(row.get("tokens_per_sec"), (int, float))
+                  and row["tokens_per_sec"] > 0, row)
+            check("行内 cache_hit_pct=40（cache_read 40 / prompt 100）",
+                  row.get("cache_hit_pct") == 40.0, row)
+            check("cached_reported=True", row.get("cached_reported") is True, row)
+        finally:
+            P.trae_solo_chat = fake_solo
+
+        # ---------------------------------------------------------------
         section("[3] 相同提示连发两次：不误去重")
         req2 = P._usage["requests"]
         before = len(usage_calls)
@@ -270,7 +314,7 @@ def main():
         check("两次 request_id 不同（uuid 每请求唯一）",
               len(rids) == 2 and rids[0] != rids[1], rids)
         rows = [r for r in read_rows(P.USAGE_LOG) if r.get("model") == MODEL]
-        check("usage 行累计 4（未被提示指纹去重）", len(rows) == 4, len(rows))
+        check("usage 行累计 5（未被提示指纹去重）", len(rows) == 5, len(rows))
 
         # ---------------------------------------------------------------
         section("[4] 上游失败：record_error、不记 usage")

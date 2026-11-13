@@ -248,6 +248,22 @@ check("7 未知模型进入 unpriced", "unknown-x" in pricing["unpriced"],
 check("7 已定价模型不进 unpriced", "dfmodel" not in pricing["unpriced"],
       pricing["unpriced"])
 
+# 7b) 回归：compute_row 曾经缺失 -> 所有行 cost_usd=0 / priced=false
+cost = P.trae_pricing.compute_row({
+    "model": "deepseek-v4.1-flash", "prompt_tokens": 1000000,
+    "completion_tokens": 1000, "cached_tokens": 0,
+})
+check("7b 已定价模型 compute_row 返回正数",
+      bool(cost.get("priced")) and cost.get("usd", 0) > 0, cost)
+check("7b 生成价表命中 or_id",
+      cost.get("or_id") == "deepseek/deepseek-v4.1-flash", cost)
+unknown_cost = P.trae_pricing.compute_row({
+    "model": "unknown-x", "prompt_tokens": 1000000,
+    "completion_tokens": 1000, "cached_tokens": 0,
+})
+check("7b 未知模型仍不计价", unknown_cost.get("priced") is False,
+      unknown_cost)
+
 # ---------------------------------------------------------------------------
 # 8) /usage/analytics：未知缓存命中率 / 推理占比不能伪造成 0%
 # ---------------------------------------------------------------------------

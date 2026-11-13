@@ -431,6 +431,35 @@ except TypeError as exc:
     _t = exc
 check("10 record_error 未知关键字仍报错（不静默吞）", isinstance(_t, TypeError), _t)
 
+# ---- 11) 积分估算：SOLO 不返回 credit 时，按账户实际消耗 × 等价花费占比 ----
+reset()
+_acct = FakeAccount("1001")
+_acct.entitlement = {"ent_usage": {"usage_summary": {
+    "total_amount": 1000, "consumed_amount": 6.0}}}
+P.POOL = FakePool([_acct])
+P._credit_factor_cache.update({"at": 0.0, "data": {}})
+P.record_usage("deepseek-v4.1-flash", {
+    "prompt_tokens": 100000, "completion_tokens": 1000,
+    "total_tokens": 101000,
+}, stream=True, elapsed_ms=100, account="1001")
+_factors = P._credit_factors(ttl=0)
+check("11 估算系数存在", _factors.get("1001", {}).get("factor", 0) > 0,
+      _factors)
+_recent = P.recent_usage(limit=10, realm=None, page=1)
+_row = (_recent.get("rows") or [{}])[0]
+check("11 最近请求带估算积分",
+      _row.get("credit_estimated") is True and _row.get("credit", 0) > 0,
+      _row)
+_split = _row.get("credit_split") or {}
+check("11 三段拆分齐全（input/cached/output）",
+      all(k in _split for k in ("input", "cached", "output")), _split)
+check("11 拆分合计 = 估算积分",
+      abs(sum(float(v or 0) for v in _split.values())
+          - float(_row.get("credit") or 0)) < 1e-5, (_split, _row))
+check("11 估算合计与账户实际消耗一致",
+      abs(float(_row.get("credit") or 0) - 6.0) < 1e-6, _row)
+P._credit_factor_cache.update({"at": 0.0, "data": {}})
+
 P.is_model_banned = _orig_banned
 if _orig_solo is not None:
     P.trae_solo_chat = _orig_solo

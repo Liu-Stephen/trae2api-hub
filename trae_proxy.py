@@ -885,7 +885,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     # 未定价模型 cost=0、priced=False，看板显示「未定价」，绝不猜。
     try:
         import trae_pricing
-        _cost = trae_pricing.compute_row(dict(row, **fields))
+        _cost = trae_pricing.compute_row(
+            dict(row, **fields),
+            overrides=trae_pricing.load_overrides(USAGE_DIR))
         fields["cost_usd"] = _cost.get("usd") or 0.0
         fields["cost_cny"] = _cost.get("cny") or 0.0
         row["priced"] = bool(_cost.get("priced"))
@@ -985,6 +987,161 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     except Exception:
         pass
     return row
+
+
+def _cost_overrides():
+    """用户价格覆盖表：读失败一律按空表处理（计价不能打断统计）。"""
+    try:
+        return trae_pricing.load_overrides(USAGE_DIR)
+    except Exception:
+        return {}
+
+
+def _row_cost(row, overrides=None):
+    """单行参考花费：优先用落盘值，旧行/未定价行按当前价表现算。
+
+    返回 (usd, cny, priced)。**只读**，绝不回写 usage.jsonl —— 历史行
+    `priced=false / cost=0` 也能在面板里显示等价花费，但原始日志保持不变。
+    overrides 由批量调用方读一次后传入，避免每行都 stat 覆盖表文件。
+    """
+    usd = row.get("cost_usd")
+    cny = row.get("cost_cny")
+    if row.get("priced") and usd is not None:
+        return float(usd or 0.0), float(cny or 0.0), True
+    try:
+        cost = trae_pricing.compute_row(row, overrides=overrides)
+        if cost.get("priced"):
+            return (float(cost.get("usd") or 0.0),
+                    float(cost.get("cny") or 0.0), True)
+    except Exception:
+        pass
+    return float(usd or 0.0), float(cny or 0.0), False
+
+
+_credit_factor_cache = {"at": 0.0, "data": {}}
+_credit_factor_lock = threading.Lock()
+
+
+def _credit_factors(ttl=60):
+    """uid -> 积分估算系数（积分 / 等价花费 USD）。
+
+    SOLO 上游不返回积分，只能按**账户实际消耗**反推：账户 entitlement 里的
+    consumed 积分 ÷ 该账号在本地日志里的等价花费。只读本地，不发任何上游请求。
+    没有消耗快照 / 没有已定价花费的账号不产生系数（保持 0，不猜）。
+
+    口径边界（必须如实告知，不能当官方账单）：
+      · consumed 是**当前计费周期**的累计值，而本地日志可能只覆盖其中一段；
+        因此系数是「本周期平均单价」，单条请求的积分是近似值，不是上游实扣；
+      · 已经带真实 credit 的行不参与折算，只用「消耗 − 真实积分」的剩余部分
+        去摊未定价的请求，避免重复计数；
+      · 整份估算的合计恒等于账户的 consumed（这是该口径的定义，不是巧合）。
+    """
+    now = time.time()
+    with _credit_factor_lock:
+        if _credit_factor_cache["at"] \
+                and (now - _credit_factor_cache["at"]) < ttl:
+            return _credit_factor_cache["data"]
+    per = {}
+    overrides = _cost_overrides()
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("error"):
+                    continue
+                uid = str(row.get("account") or "")
+                if not uid:
+                    continue
+                bucket = per.setdefault(
+                    uid, {"cost": 0.0, "real_credit": 0.0})
+                credit = float(row.get("credit") or 0.0)
+                if credit > 0:
+                    bucket["real_credit"] += credit
+                    continue
+                usd, _cny, priced = _row_cost(row, overrides=overrides)
+                if priced and usd > 0:
+                    bucket["cost"] += usd
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("credit estimate scan failed: %s" % exc)
+    data = {}
+    for account in (POOL.accounts if POOL else []):
+        bucket = per.get(str(getattr(account, "uid", "") or ""))
+        if not bucket or bucket["cost"] <= 0:
+            continue
+        try:
+            used = float(account_credit_view(account).get("used") or 0.0)
+        except Exception:
+            used = 0.0
+        remaining = max(0.0, used - bucket["real_credit"])
+        if remaining <= 0:
+            continue
+        data[str(account.uid)] = {
+            "factor": remaining / bucket["cost"],
+            "used": used,
+            "cost_usd": bucket["cost"],
+            "real_credit": bucket["real_credit"],
+        }
+    with _credit_factor_lock:
+        _credit_factor_cache.update({"at": now, "data": data})
+    return data
+
+
+def _row_credit(row, factors=None, overrides=None):
+    """单行积分（真实或估算）+ 三段拆分。
+
+    返回 dict：credit / original_credits / split / estimated / split_estimated。
+    · 上游真报了 credit：直接用，拆分按三段等价花费占比折算（标记 split_estimated）；
+    · 没报：用账户实际消耗 × 该行等价花费占比估算（credit_estimated）。
+    """
+    credit = float(row.get("credit") or 0.0)
+    orig = float(row.get("original_credits") or 0.0)
+    if credit > 0:
+        split = row.get("credit_split")
+        split_estimated = False
+        if not isinstance(split, dict):
+            segs = trae_pricing.compute_segments(
+                row.get("model"), row.get("prompt_tokens"),
+                row.get("completion_tokens"), row.get("cached_tokens"),
+                overrides=overrides)
+            total = segs.get("usd") or 0.0
+            if total > 0:
+                split = {key: credit * (segs.get(key) or 0.0) / total
+                         for key in ("input", "cached", "output")}
+                split_estimated = True
+            else:
+                split = None
+        return {"credit": credit, "original_credits": orig,
+                "split": split, "estimated": False,
+                "split_estimated": split_estimated}
+    factor = (factors or {}).get(str(row.get("account") or ""))
+    if not factor:
+        return {"credit": 0.0, "original_credits": 0.0, "split": None,
+                "estimated": False, "split_estimated": False}
+    segs = trae_pricing.compute_segments(
+        row.get("model"), row.get("prompt_tokens"),
+        row.get("completion_tokens"), row.get("cached_tokens"),
+        overrides=overrides)
+    usd = segs.get("usd") or 0.0
+    if not segs.get("priced") or usd <= 0:
+        return {"credit": 0.0, "original_credits": 0.0, "split": None,
+                "estimated": False, "split_estimated": False}
+    k = float(factor.get("factor") or 0.0)
+    if k <= 0:
+        return {"credit": 0.0, "original_credits": 0.0, "split": None,
+                "estimated": False, "split_estimated": False}
+    split = {key: (segs.get(key) or 0.0) * k
+             for key in ("input", "cached", "output")}
+    est = usd * k
+    return {"credit": est, "original_credits": est, "split": split,
+            "estimated": True, "split_estimated": True}
 
 
 def _persist_usage(row, summary, fail_label):
@@ -1295,6 +1452,8 @@ def _usage_snapshot_uncached(realm=None):
     rep = POOL.representative(realm=r) if POOL else current_account()
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
+    cost_overrides = _cost_overrides()
+    credit_factors = _credit_factors()
     try:
         with open(USAGE_LOG, encoding="utf-8") as fh:
             for line in fh:
@@ -1311,8 +1470,24 @@ def _usage_snapshot_uncached(realm=None):
                     snap["errors"] += 1
                 else:
                     snap["requests"] += 1
+                    # 旧行没有 cost / priced=false：读取时按当前价表现算，
+                    # 让历史 token 也能计入「API 等价花费」，但不改日志。
+                    row_usd, row_cny, _priced = _row_cost(
+                        row, overrides=cost_overrides)
+                    credit_info = _row_credit(
+                        row, credit_factors, overrides=cost_overrides)
+                    row_credit = credit_info["credit"]
+                    row_orig = credit_info["original_credits"]
                     for k in USAGE_FIELDS:
-                        if k in row:
+                        if k == "cost_usd":
+                            snap[k] += row_usd
+                        elif k == "cost_cny":
+                            snap[k] += row_cny
+                        elif k == "credit":
+                            snap[k] += row_credit
+                        elif k == "original_credits":
+                            snap[k] += row_orig
+                        elif k in row:
                             snap[k] += (row[k] or 0)
                     m = row.get("model") or "unknown"
                     per = snap["by_model"].setdefault(
@@ -1320,7 +1495,15 @@ def _usage_snapshot_uncached(realm=None):
                             **{k: 0 for k in USAGE_FIELDS}})
                     per["requests"] += 1
                     for k in USAGE_FIELDS:
-                        if k in row:
+                        if k == "cost_usd":
+                            per[k] += row_usd
+                        elif k == "cost_cny":
+                            per[k] += row_cny
+                        elif k == "credit":
+                            per[k] += row_credit
+                        elif k == "original_credits":
+                            per[k] += row_orig
+                        elif k in row:
                             per[k] += (row[k] or 0)
                     acct_id = row.get("account")
                     if acct_id:
@@ -1418,7 +1601,11 @@ def count_usage_rows(realm=None):
 
 
 def recent_usage(limit=100, realm=None, page=1):
-    """Paginated rows from the tail of the log (page 1 is latest)."""
+    """Paginated rows from the tail of the log (page 1 is latest).
+
+    返回前会给缺 credit 的行补上**估算积分**与三段拆分（credit_estimated /
+    credit_split_estimated 标记），口径见 _credit_factors()。
+    """
     try:
         limit = max(1, int(limit))
     except Exception:
@@ -1472,6 +1659,24 @@ def recent_usage(limit=100, realm=None, page=1):
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     page_rows = matching[start_idx:end_idx]
+    # 积分列：上游没报 credit 的行按账户实际消耗估算，并把三段拆分一并下发。
+    # 只改内存里的返回副本，不触碰 usage.jsonl。
+    factors = _credit_factors()
+    overrides = _cost_overrides()
+    for row in page_rows:
+        if row.get("error"):
+            continue        # 失败行没有出账区，不估积分（前端也显示 —）
+        info = _row_credit(row, factors, overrides=overrides)
+        if info["estimated"]:
+            row["credit"] = round(info["credit"], 6)
+            row["original_credits"] = round(info["original_credits"], 6)
+            row["credit_estimated"] = True
+        if info["split"]:
+            row["credit_split"] = {
+                key: round(value, 6)
+                for key, value in info["split"].items()}
+            if info["split_estimated"]:
+                row["credit_split_estimated"] = True
     return {
         "total": total,
         "page": page,
@@ -1818,13 +2023,16 @@ def usage_remaining(ttl=10):
 
     def build():
         used = {}
+        credit_factors = _credit_factors()
+        cost_overrides = _cost_overrides()
         for row in _iter_usage_window(since):
             if row.get("error"):
                 continue
             uid = str(row.get("account") or "")
             cell = used.setdefault(uid, {"credit": 0.0, "tokens": 0, "requests": 0})
             try:
-                credit = float(row.get("credit") or 0)
+                credit = float(_row_credit(
+                    row, credit_factors, overrides=cost_overrides)["credit"])
             except (TypeError, ValueError):
                 credit = 0.0
             try:
@@ -1955,6 +2163,8 @@ def credits_usage_daily(ttl=30, days=365):
     def build():
         daily_map = {}
         acct_map = {}
+        credit_factors = _credit_factors()
+        cost_overrides = _cost_overrides()
         for row in _iter_usage_window(since):
             if row.get("error"):
                 continue
@@ -1963,7 +2173,8 @@ def credits_usage_daily(ttl=30, days=365):
                 continue
             day = time.strftime("%Y-%m-%d", time.localtime(at))
             try:
-                credit = float(row.get("credit") or 0)
+                credit = float(_row_credit(
+                    row, credit_factors, overrides=cost_overrides)["credit"])
             except (TypeError, ValueError):
                 credit = 0.0
             daily_map[day] = daily_map.get(day, 0.0) + credit
@@ -2370,6 +2581,7 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
     """One uncached pass over the log, folding rows into fixed-width buckets."""
     buckets = {}
     credits = []
+    credit_factors = _credit_factors()
     try:
         with open(USAGE_LOG, encoding="utf-8") as fh:
             for line in fh:
@@ -2401,7 +2613,8 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
                                   "reasoning_tokens", "cached_tokens",
                                   "total_tokens"):
                         bucket[field] += (row.get(field) or 0)
-                credit = row.get("credit") or 0
+                credit_info = _row_credit(row, credit_factors)
+                credit = 0.0 if row.get("error") else credit_info["credit"]
                 bucket["credit"] += credit
                 if credit > 0:
                     credits.append({
@@ -2409,6 +2622,8 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
                         "model": row.get("model") or "",
                         "account": row.get("account") or "",
                         "credit": credit,
+                        "credit_estimated": bool(
+                            credit_info.get("estimated")),
                         "total_tokens": row.get("total_tokens") or 0,
                     })
     except FileNotFoundError:
@@ -2608,6 +2823,8 @@ def _usage_log_head_ts(probe_bytes=4096):
 
 def _usage_daily_uncached(days, group, realm, since):
     until = since + days * 86400
+    cost_overrides = _cost_overrides()
+    credit_factors = _credit_factors()
     series = []
     index = {}
     for i in range(days):
@@ -2660,10 +2877,13 @@ def _usage_daily_uncached(days, group, realm, since):
         for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                       "cached_tokens", "total_tokens"):
             item[field] += (row.get(field) or 0)
-        credit = row.get("credit") or 0
+        credit = (0.0 if is_err else
+                  _row_credit(row, credit_factors)["credit"])
         item["credit"] += credit
-        item["cost_usd"] += (row.get("cost_usd") or 0.0)
-        item["cost_cny"] += (row.get("cost_cny") or 0.0)
+        row_usd, row_cny, _priced = (0.0, 0.0, False) if is_err \
+            else _row_cost(row, overrides=cost_overrides)
+        item["cost_usd"] += row_usd
+        item["cost_cny"] += row_cny
         gid = _daily_group_id(row, group)
         item["groups"][gid] = item["groups"].get(gid, 0) + tokens
         agg = groups.get(gid)
@@ -2678,8 +2898,8 @@ def _usage_daily_uncached(days, group, realm, since):
         agg["credit"] += credit
         totals["total_tokens"] += tokens
         totals["credit"] += credit
-        totals["cost_usd"] += (row.get("cost_usd") or 0.0)
-        totals["cost_cny"] += (row.get("cost_cny") or 0.0)
+        totals["cost_usd"] += row_usd
+        totals["cost_cny"] += row_cny
         if is_err:
             totals["errors"] += 1
         else:
@@ -2763,6 +2983,7 @@ def compute_usage_analytics(range=None, since=None, until=None):
     win_model = {}      # model id -> stat
     acct_map = {}
     model_map = {}
+    cost_overrides = _cost_overrides()
     if os.path.exists(USAGE_LOG):
         try:
             with open(USAGE_LOG, encoding="utf-8") as fh:
@@ -2780,6 +3001,10 @@ def compute_usage_analytics(range=None, since=None, until=None):
                     in_window = _row_in_window(r, lo, hi)
                     acct_uid = r.get("account") or "(unattributed)"
                     m_id = r.get("model") or "(unknown)"
+                    # 与 /usage 同口径：旧行按当前价表现算，新行直接用落盘值。
+                    row_usd, row_cny, row_priced = (
+                        (0.0, 0.0, False) if is_err
+                        else _row_cost(r, overrides=cost_overrides))
 
                     def feed(stat_obj, is_error):
                         if is_error:
@@ -2800,9 +3025,9 @@ def compute_usage_analytics(range=None, since=None, until=None):
                             if r.get("elapsed_ms"):
                                 stat_obj["elapsed_sum"] += r["elapsed_ms"]
                                 stat_obj["elapsed_n"] += 1
-                            stat_obj["cost_usd"] += (r.get("cost_usd") or 0.0)
-                            stat_obj["cost_cny"] += (r.get("cost_cny") or 0.0)
-                            if r.get("priced"):
+                            stat_obj["cost_usd"] += row_usd
+                            stat_obj["cost_cny"] += row_cny
+                            if row_priced:
                                 stat_obj["priced_rows"] += 1
 
                     feed(all_summary, is_err)
@@ -6870,6 +7095,21 @@ def trae_solo_chat(account, payload, timeout=None):
                 usage = {"prompt_tokens": int(event.get("prompt_tokens") or 0),
                          "completion_tokens": int(event.get("completion_tokens") or 0),
                          "total_tokens": int(event.get("total_tokens") or 0)}
+                # 缓存/推理细分：上游**报了才带出**，缺键就不写 —— usage_fields()
+                # 据此把 cached_reported 判为 False（不知道 ≠ 0% 命中）。
+                for key in ("cached_tokens", "prompt_cache_hit_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens"):
+                    if event.get(key) is not None:
+                        usage[key] = event.get(key)
+                for key in ("prompt_tokens_details",
+                            "completion_tokens_details"):
+                    if isinstance(event.get(key), dict):
+                        usage[key] = dict(event[key])
+                if event.get("reasoning_tokens") is not None:
+                    # 顶层 reasoning_tokens 归一到 usage_fields() 认的明细结构。
+                    usage.setdefault("completion_tokens_details", {}).setdefault(
+                        "reasoning_tokens", event.get("reasoning_tokens"))
                 if emit:
                     emit(("usage", usage))
     finally:
@@ -11439,6 +11679,22 @@ class Handler(BaseHTTPRequestHandler):
                     + "\n\n").encode("utf-8")
 
         stream_state = {"started": False, "body": False}
+        # 首字时刻（monotonic）：第一个正文/推理/工具增量到达的时间。
+        # SOLO 上游把「排队 / 等首包」都算进 started，这里才能量出真实 TTFT；
+        # 拿不到就是 None（不伪造 0）。
+        first_at = [None]
+
+        def note_first(kind, value):
+            if first_at[0] is None and value and kind in (
+                    "text", "reasoning", "tool"):
+                first_at[0] = time.monotonic()
+
+        def timing():
+            """-> (elapsed_ms, ttft_ms, gen_ms)，未拿到首字时后两者为 None。"""
+            wall = int((time.monotonic() - started) * 1000)
+            ttft = (int((first_at[0] - started) * 1000)
+                    if first_at[0] is not None else None)
+            return wall, ttft, (wall - ttft) if ttft is not None else None
 
         def ensure_stream():
             if not stream_state["started"]:
@@ -11448,6 +11704,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def emit_frame(event):
             kind, value = event
+            note_first(kind, value)
             if kind == "text":
                 if value:
                     stream_state["body"] = True
@@ -11485,6 +11742,7 @@ class Handler(BaseHTTPRequestHandler):
             if trae_token_expired(acc):
                 trae_refresh_account(acc, "cn")
             call_payload = dict(payload, model=model)
+            first_at[0] = None      # 换号重试后重新计首字（started 仍是请求起点）
             try:
                 if want_stream:
                     result = self._solo_pump(
@@ -11492,7 +11750,11 @@ class Handler(BaseHTTPRequestHandler):
                             acc, dict(call_payload, _on_delta=emit)),
                         emit_frame, ensure_stream, stream_state)
                 else:
-                    result = trae_solo_chat(acc, call_payload)
+                    # 非流式也挂一个只记首字时刻的回调：不改变聚合结果，
+                    # 但能测出「上游多久吐出第一个增量」。
+                    result = trae_solo_chat(
+                        acc, dict(call_payload,
+                                  _on_delta=lambda ev: note_first(*ev)))
                 account = acc
                 try:
                     acc.note_success(model=model)
@@ -11505,9 +11767,10 @@ class Handler(BaseHTTPRequestHandler):
                                     ConnectionAbortedError)):
                     # 客户端断开：上游已产出的部分照常记账，不再尝试写任何帧。
                     try:
+                        wall, ttft_ms, gen_ms = timing()
                         record_usage(
                             model, None, stream=True,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=wall, ttft_ms=ttft_ms, gen_ms=gen_ms,
                             account=acc.uid,
                             key_id=self._key_id_for_usage(),
                             fp=fp, request_id=request_id)
@@ -11563,8 +11826,9 @@ class Handler(BaseHTTPRequestHandler):
             "tool_calls" if tool_calls else "stop")
         usage = result.get("usage")
 
+        wall, ttft_ms, gen_ms = timing()
         record_usage(model, usage, stream=want_stream,
-                     elapsed_ms=int((time.monotonic() - started) * 1000),
+                     elapsed_ms=wall, ttft_ms=ttft_ms, gen_ms=gen_ms,
                      account=account.uid, key_id=self._key_id_for_usage(),
                      fp=fp, request_id=request_id)
 

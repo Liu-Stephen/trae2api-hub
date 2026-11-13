@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+### 最近请求的积分 / 积分拆分
+
+- SOLO 上游的 `token_usage` 帧实测只有 token / cache / reasoning，**没有积分字段**；因此「最近请求」的积分列现在按**账户实际消耗积分**估算：账户 entitlement 的累计 consumed ÷ 本地日志的等价花费，再按每条请求的三段（非缓存输入 / 缓存输入 / 输出）等价花费占比分摊。
+- 表格用 `≈` 标注估算值，悬停提示「上游未返回单请求积分」；估算合计与账户实际消耗对得上，不把估算伪装成官方扣费。
+- 上游真返回 `credit` 时优先用真实值；真实值没有三段拆分时，也按等价花费占比补出拆分。
+- `/usage` 汇总、`/usage/timeseries`、`/accounts/credits/usage`、`/usage/remaining` 的积分口径同步使用估算值。
+
+### API 等价花费修复
+
+- 修复 `trae_pricing.compute_row` 缺失导致所有请求都记成 `cost_usd=0 / priced=false` 的问题：恢复按 `pricing/trae_pricing.json`（OpenRouter 表，含长上下文 bands）计价，「用量洞察」的 API 等价花费不再恒为 `$0.0000`。
+- 历史 usage 行不重写日志：读取时按当前价表现算等价花费，旧数据也能立即显示；新行仍按落盘值直接汇总。
+- 定价覆盖表 `usage/pricing-overrides.json` 同时作用于新行记账与读取兜底；`/pricing` 的 `table` / `unpriced` 改为包含生成价表，模型卡参考价恢复可用。
+
+### SOLO 用量补全
+
+- 「最近请求」的首字 / 速度恢复：SOLO（`/v1/chat/completions` 的 Agent 模型与 `/v1/agent/chat`）此前记账不带 `ttft_ms` / `gen_ms`，表格只能显示 `—`；现在按第一个正文/推理/工具增量计时，流式与非流式都写入真实 TTFT 与 tokens/s（拿不到首字仍记 `null`，不伪造 0）。
+- SOLO 的 `token_usage` 若带缓存 / 推理细分（`cache_read_input_tokens`、`cached_tokens`、`prompt_tokens_details`、`reasoning_tokens` 等）会原样落盘，「缓存」列可显示真实命中率；上游没报时仍显示 `—`，不把未知算成 0%。
+
 ### 统计页收尾
 
 - 修复 `--usage-dir` 下 `/usage/stats` 仍读默认 `usage/` 的问题：模块名 `__main__` 时懒 `import trae_proxy` 会重复执行模块级 `stats.configure()`，把运行期路径覆盖回默认目录；统计与调度器改为优先复用 `__main__`，并给 `stats.configure()` 加显式配置门闩。

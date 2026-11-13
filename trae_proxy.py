@@ -541,8 +541,12 @@ USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 # 统计模块与网关必须读同一份文件：显式接线（stats 的默认路径也同源，但
 # configure 让 deployment/测试可以覆盖，不再靠两边各自猜）。
 try:
-    trae_stats.configure(usage_dir=USAGE_DIR, log_path=USAGE_LOG,
-                         summary_path=USAGE_SUMMARY)
+    # 只在尚未显式配置时接线：`python trae_proxy.py` 下模块名是 __main__，
+    # 之后任何 `import trae_proxy` 都会再次执行本文件；不能让它用默认目录
+    # 覆盖运行期的 --usage-dir / 测试夹具。
+    if not getattr(trae_stats, "_CONFIGURED", False):
+        trae_stats.configure(usage_dir=USAGE_DIR, log_path=USAGE_LOG,
+                             summary_path=USAGE_SUMMARY)
 except Exception:
     pass
 try:
@@ -1527,6 +1531,17 @@ SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
 
 def account_credit_view(account):
     """Normalize plan + check-in credits + quota for dashboard/API."""
+    # Account._credit_view 已经包含额度包拆分（composition）；优先复用它，
+    # 避免这里再维护一份会漂移的口径。桩账号没有该方法时走下面的兜底。
+    view_fn = getattr(account, "_credit_view", None)
+    if callable(view_fn):
+        try:
+            view = view_fn(account)
+            if isinstance(view, dict) and view:
+                view.setdefault("size", view.get("limit", 0))
+                return view
+        except Exception:
+            pass
     ent = getattr(account, "entitlement", None) or {}
     usage = ent.get("ent_usage") if isinstance(ent.get("ent_usage"), dict) else {}
     packs = usage.get("user_entitlement_pack_list") or []
@@ -1549,6 +1564,14 @@ def account_credit_view(account):
             consumed = int(used.get("advanced_model_request_usage") or 0)
     except (TypeError, ValueError):
         limit, consumed = 0, 0
+    composition = trae_accounts.credit_composition(account)
+    if composition:
+        comp_size = sum(float(c.get("size") or 0) for c in composition)
+        comp_used = sum(float(c.get("used") or 0) for c in composition)
+        if limit <= 0:
+            limit = comp_size
+        if consumed <= 0 and comp_used > 0:
+            consumed = comp_used
     remain = max(0, limit - consumed)
     if isinstance(remain, float):
         remain = round(remain, 2)
@@ -1564,8 +1587,10 @@ def account_credit_view(account):
         "plan": plan,
         "remain": remain,
         "limit": limit,
+        "size": limit,
         "used": consumed,
         "total": limit,
+        "composition": composition,
         "updated_at": getattr(account, "usage_updated_at", 0) or 0,
         "source": "entitlement+checkin",
     }
@@ -1694,6 +1719,11 @@ def account_views(realm=None):
 _CREDITS_SUMMARY_NOTE = ("registered values only; freshness depends on "
                          "check-in and consumption write-back")
 
+# 统计附属端点（剩余用量 / 积分包 / 逐日积分 / 定价覆盖）共用的小缓存。
+# 这些端点都由用量洞察页轮询触发，但扫描的是同一份本地日志；10~60 秒的
+# TTL 足够让面板保持「近实时」，又不会每次轮询都重扫整份 usage.jsonl。
+_AUX_CACHE = trae_cache.JsonResultCache()
+
 # 按**解析后的窗口边界**分键：(since, until) -> (at, data)。week/month 相互重叠，
 # 一个"范围标签"键会让一个窗口的数据冒充另一个（见 range_window 的注释）。
 _byacct_cache = {}
@@ -1721,7 +1751,7 @@ def credits_summary():
     accounts = list(POOL.accounts) if POOL else []
     for a in accounts:
         try:
-            view = a._credit_view(a)
+            view = account_credit_view(a)
         except Exception:
             view = {}
         cred = dict(view)
@@ -1746,6 +1776,9 @@ def credits_summary():
             "credits_size": cred.get("size"),
             "checkin": cred.get("checkin"),
             "checkin_at": cred.get("checkin_at"),
+            "composition": cred.get("composition") or [],
+            "source": cred.get("source") or "",
+            "shared": cred.get("shared"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
         })
@@ -1758,6 +1791,287 @@ def credits_summary():
         "accounts": rows,
         "note": _CREDITS_SUMMARY_NOTE,
     }
+
+
+def _credit_remain_value(view):
+    """从额度视图取「剩余」，保留小数；读不到返回 None。"""
+    if not isinstance(view, dict):
+        return None
+    raw = view.get("remain")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def usage_remaining(ttl=10):
+    """按账号估算剩余积分可用天数（近 24 小时消耗线性外推）。
+
+    数据源只有本地：账号 JSON 里登记的 credits + usage.jsonl 的逐请求 credit。
+    不触发任何上游调用，也不把「没有消耗样本」伪造成 0 天——那种行 days_left
+    为 None，前端显示「—」。
+    """
+    now = time.time()
+    since = now - 86400
+
+    def build():
+        used = {}
+        for row in _iter_usage_window(since):
+            if row.get("error"):
+                continue
+            uid = str(row.get("account") or "")
+            cell = used.setdefault(uid, {"credit": 0.0, "tokens": 0, "requests": 0})
+            try:
+                credit = float(row.get("credit") or 0)
+            except (TypeError, ValueError):
+                credit = 0.0
+            try:
+                tokens = int(row.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                tokens = 0
+            cell["credit"] += credit
+            cell["tokens"] += tokens
+            cell["requests"] += 1
+
+        rows = []
+        accounts = list(POOL.accounts) if POOL else []
+        known = set()
+        for a in accounts:
+            uid = str(getattr(a, "uid", "") or "")
+            known.add(uid)
+            view = account_credit_view(a)
+            remain = _credit_remain_value(view)
+            cell = used.get(uid) or {}
+            credit_24h = float(cell.get("credit") or 0)
+            days_left = None
+            if remain is not None and credit_24h > 0:
+                days_left = round(max(0.0, remain) / credit_24h, 1)
+            rows.append({
+                "uid": uid,
+                "account": account_label(a),
+                "realm": getattr(a, "realm", "") or "",
+                "remain": remain,
+                "limit": view.get("limit") if isinstance(view, dict) else None,
+                "unlimited": bool(view.get("unlimited")) if isinstance(view, dict) else False,
+                "used_24h_credit": round(credit_24h, 2),
+                "used_24h_tokens": int(cell.get("tokens") or 0),
+                "requests_24h": int(cell.get("requests") or 0),
+                "days_left": days_left,
+            })
+        # 日志里出现但账号池已删除的 uid：仍然展示，避免「有消耗但看不到」。
+        for uid, cell in used.items():
+            if not uid or uid in known:
+                continue
+            credit_24h = float(cell.get("credit") or 0)
+            rows.append({
+                "uid": uid,
+                "account": uid[:8],
+                "realm": "",
+                "remain": None,
+                "limit": None,
+                "unlimited": False,
+                "used_24h_credit": round(credit_24h, 2),
+                "used_24h_tokens": int(cell.get("tokens") or 0),
+                "requests_24h": int(cell.get("requests") or 0),
+                "days_left": None,
+            })
+        rows.sort(key=lambda r: (r["days_left"] is None,
+                                 r["days_left"] if r["days_left"] is not None else 0,
+                                 -(r["used_24h_credit"] or 0)))
+        days = [r["days_left"] for r in rows if r["days_left"] is not None]
+        total_credit = sum(r["used_24h_credit"] or 0 for r in rows)
+        return {
+            "ok": True,
+            "rows": rows,
+            "days_left": (min(days) if days else None),
+            "daily_rate": round(total_credit, 2),
+            "active_accounts": sum(1 for r in rows if (r["requests_24h"] or 0) > 0),
+            "window_seconds": 86400,
+        }
+
+    return _AUX_CACHE.get(("remaining",), build, ttl=ttl)
+
+
+def credits_grants(ttl=10):
+    """把每个账号的 entitlement 额度容器摊平成「积分包 / 获取记录」。"""
+    def build():
+        rows = []
+        accounts = list(POOL.accounts) if POOL else []
+        for a in accounts:
+            view = account_credit_view(a)
+            for comp in view.get("composition") or []:
+                if not isinstance(comp, dict):
+                    continue
+                rows.append({
+                    "account": account_label(a),
+                    "uid": str(getattr(a, "uid", "") or ""),
+                    "realm": getattr(a, "realm", "") or "",
+                    "name": comp.get("name") or "额度包",
+                    "kind": comp.get("kind") or "pack",
+                    "size": comp.get("size") or 0,
+                    "remain": comp.get("remain") or 0,
+                    "used": comp.get("used") or 0,
+                    "expires_at": comp.get("expires_at") or 0,
+                    "source": comp.get("source") or "",
+                })
+        rows.sort(key=lambda r: (r["expires_at"] or 10 ** 12,
+                                 r["account"], r["name"]))
+        size = round(sum(float(r["size"] or 0) for r in rows), 2)
+        remain = round(sum(float(r["remain"] or 0) for r in rows), 2)
+        used = round(sum(float(r["used"] or 0) for r in rows), 2)
+        return {
+            "ok": True,
+            "rows": rows,
+            "count": len(rows),
+            "summary": {"count": len(rows), "size": size,
+                        "remain": remain, "used": used},
+        }
+
+    return _AUX_CACHE.get(("grants",), build, ttl=ttl)
+
+
+def _credit_day_cursor(start):
+    """从某个本地零点前进一个自然日（DST 安全）。"""
+    return _local_day_start(start + 86400 + 43200)
+
+
+def credits_usage_daily(ttl=30, days=365):
+    """按本地自然日汇总 usage.jsonl 里的 credit 消耗。
+
+    这是**网关口径**的积分消耗（逐请求 credit 求和），不是上游客户端
+    「官方逐日消耗」接口；两者在当前代码里没有同源数据，因此响应里带
+    source=usage_log，前端也按本地口径标注，避免把估算说成官方账单。
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 365
+    days = max(1, min(365, days))
+    since = _local_midnight(days - 1)
+    now = time.time()
+
+    def build():
+        daily_map = {}
+        acct_map = {}
+        for row in _iter_usage_window(since):
+            if row.get("error"):
+                continue
+            at = row.get("at")
+            if not isinstance(at, (int, float)):
+                continue
+            day = time.strftime("%Y-%m-%d", time.localtime(at))
+            try:
+                credit = float(row.get("credit") or 0)
+            except (TypeError, ValueError):
+                credit = 0.0
+            daily_map[day] = daily_map.get(day, 0.0) + credit
+            uid = str(row.get("account") or "(unattributed)")
+            cell = acct_map.setdefault(uid, {
+                "total": 0.0, "daily": {}, "requests": 0, "tokens": 0,
+            })
+            cell["total"] += credit
+            cell["daily"][day] = cell["daily"].get(day, 0.0) + credit
+            cell["requests"] += 1
+            try:
+                cell["tokens"] += int(row.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        has_any = any(v > 0 for v in daily_map.values())
+        daily = []
+        if has_any:
+            cursor = since
+            while cursor <= now + 1:
+                day = time.strftime("%Y-%m-%d", time.localtime(cursor))
+                daily.append({"date": day,
+                              "value": round(daily_map.get(day, 0.0), 2)})
+                cursor = _credit_day_cursor(cursor)
+
+        accounts = []
+        known = set()
+        for a in (POOL.accounts if POOL else []):
+            uid = str(getattr(a, "uid", "") or "")
+            known.add(uid)
+            cell = acct_map.get(uid) or {"total": 0.0, "daily": {},
+                                         "requests": 0, "tokens": 0}
+            peak_date = ""
+            peak = 0.0
+            if cell["daily"]:
+                peak_date = max(sorted(cell["daily"]),
+                                key=lambda d: cell["daily"][d])
+                peak = cell["daily"][peak_date]
+            accounts.append({
+                "uid": uid,
+                "nickname": account_label(a),
+                "realm": getattr(a, "realm", "") or "",
+                "total": round(float(cell["total"]), 2),
+                "peak": round(float(peak), 2),
+                "peak_date": peak_date,
+                "requests": int(cell["requests"]),
+                "tokens": int(cell["tokens"]),
+                "ok": True,
+                "error": "",
+            })
+        for uid, cell in acct_map.items():
+            if not uid or uid in known:
+                continue
+            peak_date = max(sorted(cell["daily"]),
+                            key=lambda d: cell["daily"][d]) if cell["daily"] else ""
+            accounts.append({
+                "uid": uid,
+                "nickname": uid[:8],
+                "realm": "",
+                "total": round(float(cell["total"]), 2),
+                "peak": round(float(cell["daily"].get(peak_date, 0.0)), 2)
+                if peak_date else 0.0,
+                "peak_date": peak_date,
+                "requests": int(cell["requests"]),
+                "tokens": int(cell["tokens"]),
+                "ok": True,
+                "error": "",
+            })
+        accounts.sort(key=lambda r: (-(r["total"] or 0), r["nickname"]))
+
+        peak = max(daily_map.values()) if daily_map else 0.0
+        peak_date = (max(sorted(daily_map), key=lambda d: daily_map[d])
+                     if daily_map else "")
+        return {
+            "ok": True,
+            "accounts": accounts,
+            "daily": daily,
+            "days": daily,           # 兼容旧字段名
+            "total": round(sum(daily_map.values()), 2),
+            "peak": round(float(peak), 2),
+            "peak_date": peak_date,
+            "source": "usage_log",
+            "window_days": days,
+        }
+
+    return _AUX_CACHE.get(("credits_usage", days), build, ttl=ttl)
+
+
+def pricing_view(ttl=60):
+    """定价覆盖视图：前端需要 table / unpriced，而不是只有 prices。"""
+    def build():
+        overrides = trae_pricing.load_overrides(USAGE_DIR)
+        table = trae_pricing.table(USAGE_DIR)
+        seen = set()
+        for row in _iter_usage_rows_since(0):
+            model = row.get("model")
+            if isinstance(model, str) and model.strip():
+                seen.add(model.strip())
+        unpriced = sorted(m for m in seen
+                          if trae_pricing.price_for(m, overrides) is None)
+        return {
+            "prices": trae_pricing.DEFAULT_PRICES,
+            "overrides": overrides,
+            "table": table,
+            "unpriced": unpriced,
+        }
+
+    return _AUX_CACHE.get(("pricing",), build, ttl=ttl)
 
 
 def usage_by_account(ttl=10, range=None, since=None, until=None):
@@ -2172,6 +2486,22 @@ def _iter_usage_rows_since(since, chunk=256 * 1024):
         fh.close()
 
 
+def _iter_usage_window(since):
+    """逆序读窗口内的行；倒读失明时用顺序全扫兜底（同 usage_daily 的判据）。"""
+    seen = False
+    for row in _iter_usage_rows_since(since):
+        seen = True
+        yield row
+    if seen:
+        return
+    head = _usage_log_head_ts()
+    if isinstance(head, (int, float)) and head >= since:
+        log("usage window: backward read went blind, falling back to full scan",
+            level="WARN", tag="usage")
+        for row in _iter_usage_rows_forward(since):
+            yield row
+
+
 def _daily_group_id(row, group):
     """一行归入哪个分组。缺失键不静默丢弃（与 by-key 视图同口径）。"""
     if group == "model":
@@ -2551,8 +2881,9 @@ def compute_usage_analytics(range=None, since=None, until=None):
         c = stat_obj["cached_tokens"]
         out = stat_obj["completion_tokens"]
         reas = stat_obj["reasoning_tokens"]
-        stat_obj["cache_hit_pct"] = round((c / p * 100), 1) if p > 0 else 0.0
-        stat_obj["reasoning_ratio"] = round((reas / out * 100), 1) if out > 0 else 0.0
+        # 未知就是 None：没有输入 / 没有输出样本时不能伪造成 0%。
+        stat_obj["cache_hit_pct"] = round((c / p * 100), 1) if p > 0 else None
+        stat_obj["reasoning_ratio"] = round((reas / out * 100), 1) if out > 0 else None
         stat_obj["ttft_ms_avg"] = round(stat_obj["ttft_sum"] / stat_obj["ttft_n"]) \
             if stat_obj["ttft_n"] > 0 else 0
         stat_obj["speed_avg"] = round(stat_obj["speed_sum"] / stat_obj["speed_n"], 1) \
@@ -10254,17 +10585,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, trae_stats.cached_usage_report("stats",
                 range=req_range, since=req_since, until=req_until))
         if path == "/pricing":
-            return self._json(200, {"prices": trae_pricing.DEFAULT_PRICES, "overrides": {}})
+            return self._json(200, pricing_view())
         if path == "/usage/remaining":
-            return self._json(200, {"ok": True, "days_left": None, "daily_rate": 0, "active_accounts": len(POOL.accounts) if POOL else 0})
+            return self._json(200, usage_remaining())
         if path == "/accounts/activity":
             limit = int((query.get("limit") or ["200"])[0]) if query.get("limit") else 200
             rows = trae_activity.recent(USAGE_DIR, limit=limit)
-            return self._json(200, {"ok": True, "rows": rows, "count": len(rows)})
+            return self._json(200, {"ok": True, "rows": rows,
+                                    "count": len(rows),
+                                    "summary": trae_activity.summarize(rows)})
         if path == "/accounts/credits/grants":
-            return self._json(200, {"ok": True, "rows": [], "count": 0})
+            return self._json(200, credits_grants())
         if path == "/accounts/credits/usage":
-            return self._json(200, {"ok": True, "total": 0.0, "peak": 0.0, "days": []})
+            return self._json(200, credits_usage_daily())
         if path == "/update/plan":
             return self._json(200, {"ok": True, "can_apply": False, "current": VERSION, "latest": VERSION, "apply_blocked_reasons": ["请在终端或使用 git pull 更新"]})
         if path == "/agents/template":
@@ -11426,6 +11759,22 @@ class Handler(BaseHTTPRequestHandler):
                 "logs": res["logs"],
                 "accounts_count": res["accounts_count"],
             })
+        if path == "/scheduler/config":
+            if not SCHEDULER:
+                return self._json(200, {"ok": False, "msg": "调度器未初始化"})
+            try:
+                status = SCHEDULER.configure(
+                    # 看板的「账号间隔抖动」字段就是签到节流抖动，不是
+                    # 0~25 分钟的窗口抖动（那个走 TRAE_SCHEDULE_JITTER_SECONDS）。
+                    checkin_jitter=payload.get("jitter_secs"),
+                    checkin_interval=payload.get("checkin_interval"),
+                    checkin_times=payload.get("checkin_times"),
+                    keepalive_times=payload.get("keepalive_times"),
+                    cron=payload.get("cron"),
+                    timezone=payload.get("timezone"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            return self._json(200, {"ok": True, "scheduler": status})
         if path == "/scheduler/trigger":
             if SCHEDULER:
                 return self._json(200, SCHEDULER.trigger_now())
@@ -12755,7 +13104,7 @@ def main():
     POOL.load()
     try:
         trae_stats.configure(usage_dir=USAGE_DIR, log_path=USAGE_LOG,
-                             summary_path=USAGE_SUMMARY, pool=POOL)
+                             summary_path=USAGE_SUMMARY, pool=POOL, log=log)
     except Exception:
         trae_stats.POOL = POOL
     load_persisted_realm()

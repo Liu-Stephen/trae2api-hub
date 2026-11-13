@@ -3827,22 +3827,23 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 <section id="sectionGrowthTasks" style="display:none">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
       <div>
-        <h2 style="margin:0">签到与福利中心</h2>
-        <div style="font-size:12px;color:var(--dim)">全自动每日签到领取积分 (+100/天)，Pro 福利包一次性 +1800；限时活动（每日领取 100 Credits 等）在官方客户端内领取，此处呈现真实状态</div>
+        <h2 style="margin:0">签到与权益中心</h2>
+        <div style="font-size:12px;color:var(--dim)">国内版每日签到 +100 积分（自动巡检默认 09:00 / 21:00）；Trae 没有独立的 Pro 福利包接口，「刷新权益」只重新拉取套餐/资源包状态。限时活动请在官方客户端领取。</div>
+        <div id="growthAutoCheckin" style="font-size:12px;color:var(--dim);margin-top:5px">自动签到：读取中…</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
           <option value="all">全部账号 (批量)</option>
         </select>
-        <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">领取全部福利</button>
-        <button id="btnCatTravel" onclick="triggerCatTravel(this)">仅领 Pro 福利包</button>
+        <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">一键签到 + 刷新权益</button>
+        <button id="btnCatTravel" onclick="triggerCatTravel(this)">仅刷新权益 / 用量</button>
       </div>
     </div>
 
     <div class="cards" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
       <div class="card"><div class="val" id="stkDays">-</div><div class="lbl" id="stkLabel">连续签到天数</div></div>
       <div class="card accent"><div class="val" id="nrgBalance">-</div><div class="lbl" id="nrgLabel">积分额度余额</div></div>
-      <div class="card accent2"><div class="val" id="catState">-</div><div class="lbl" id="catDesc">Pro 福利包状态</div></div>
+      <div class="card accent2"><div class="val" id="catState">-</div><div class="lbl" id="catDesc">权益包状态</div></div>
       <div class="card" id="cardVmState" title="官方客户端按设备风控身份下发活动；本机虚拟化环境会被计入风险画像">
         <div class="val" id="vmState" style="font-size:16px">-</div>
         <div class="lbl" id="vmDesc">本机虚拟化检测</div>
@@ -4035,7 +4036,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       <div id="creditCompWrap"></div>
     </div>
     <div class="insight-block">
-      <h2>官方积分消耗 <em id="creditUsageHint"></em></h2>
+      <h2>积分消耗 <em id="creditUsageHint"></em></h2>
       <div id="creditUsageWrap"></div>
     </div>
 
@@ -4050,7 +4051,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
     </div>
 
     <div class="insight-block">
-      <h2>签到 / 领取流水 <em id="activityHint"></em></h2>
+      <h2>签到 / 权益流水 <em id="activityHint"></em></h2>
       <div class="table-wrap" id="activityWrap"></div>
     </div>
 </section>
@@ -6254,9 +6255,36 @@ function refreshVmState(btn){
   });
 }
 
+async function loadGrowthAutoStatus(){
+  const el = document.getElementById("growthAutoCheckin");
+  if(!el) return;
+  try{
+    const s = await getJSON("/scheduler");
+    if(!s || typeof s !== "object"){
+      el.textContent = "自动签到：状态未知";
+      return;
+    }
+    if(s.enabled === false){
+      el.innerHTML = '自动签到：<b style="color:var(--warn)">已暂停</b>（到「维护任务」页启用调度）';
+      return;
+    }
+    const hours = Array.isArray(s.hours) ? s.hours : [];
+    const fallback = hours.length
+      ? hours.map(h => String(h).padStart(2, "0") + ":00").join(",")
+      : "09:00,21:00";
+    const times = s.checkin_times || fallback;
+    el.innerHTML = '自动签到：<b style="color:var(--ok)">已开启</b> · 每日 ' + esc(times)
+      + ' · 上次 ' + esc(s.last_run_time || "尚未运行")
+      + ' · 下次巡检 ' + esc(s.next_run_time || "待调度");
+  }catch(e){
+    el.textContent = "自动签到：状态读取失败";
+  }
+}
+
 async function loadGrowthTasks(opts){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
+  loadGrowthAutoStatus();
   // 双区域都展示：签到能力由后端运行时探测，接口不存在时任务行会给出原因
   sec.style.display = 'block';
   const realm = window.VIEW_REALM || "intl";
@@ -6374,17 +6402,17 @@ function renderGrowthTasks(r){
     const elCatDesc = document.getElementById("catDesc");
     if(elCat){
       if(tr.state === 'arrived') {
-        elCat.innerHTML = '<span style="color:#26bb82">Pro 包可领取！</span>';
-        if(elCatDesc) elCatDesc.textContent = '领取奖励 +' + (tr.reward_credit || 1800) + ' 积分';
+        elCat.innerHTML = '<span style="color:#26bb82">权益包可用</span>';
+        if(elCatDesc) elCatDesc.textContent = '剩余 ' + fmt(tr.reward_credit || 0) + ' 积分（无需领取）';
       } else if(tr.daily_limit_reached) {
-        elCat.textContent = '已领取 / 活动结束';
-        if(elCatDesc) elCatDesc.textContent = '一次性福利，不可重复领取';
+        elCat.textContent = '无可用余额';
+        if(elCatDesc) elCatDesc.textContent = '权益包已到期或额度耗尽';
       } else if(tr.state === 'traveling') {
-        elCat.innerHTML = '<span style="color:var(--accent)">处理中...</span>';
+        elCat.innerHTML = '<span style="color:var(--accent)">刷新中...</span>';
         if(elCatDesc) elCatDesc.textContent = '稍后再来查看';
       } else {
         elCat.textContent = '待确认';
-        if(elCatDesc) elCatDesc.textContent = '点击「领取福利包」检查资格';
+        if(elCatDesc) elCatDesc.textContent = '点击「刷新权益 / 用量」检查';
       }
     }
 
@@ -6546,7 +6574,7 @@ var INSIGHT_GRANTS = [];
 var INSIGHT_REMAIN = [];
 var INSIGHT_ACTIVITY = [];
 var INSIGHT_SIG = "";
-// 官方积分消耗（0.4.3 客户端新增接口 /accounts/credits/usage）：累计 + 峰值日 + 365 天热力图
+// 积分消耗（/accounts/credits/usage）：按本地 usage.jsonl 的 credit 汇总累计 + 峰值日 + 365 天热力图
 var CREDIT_USAGE_SIG = "";
 var CREDIT_USAGE_AT = 0;
 // issue #129 后续：把「缓存为 0 的超长 prompt」单独拎出来 —— 它是最容易被忽略的成本项
@@ -6691,13 +6719,13 @@ async function loadCreditUsage(force){
     return;
   }
   const sig = JSON.stringify([d.total, d.peak, d.peak_date, (d.daily || []).length]);
-  if(hint) statSetText(hint, "（官方口径 · 累计 " + fmt(Math.round(d.total || 0)) + " 积分）");
+  if(hint) statSetText(hint, "（本地 usage 日志口径 · 累计 " + fmt(Math.round(d.total || 0)) + " 积分）");
   if(sig === CREDIT_USAGE_SIG) return;   // 数据没变就不重建（issue #98 的老教训）
   CREDIT_USAGE_SIG = sig;
   const daily = d.daily || [];
   const failed = (d.accounts || []).filter(a => a && a.ok === false);
   if(!daily.length){
-    box.innerHTML = '<div class="stat-empty">官方返回的逐日消耗为空（该账号可能还没产生用量）</div>';
+    box.innerHTML = '<div class="stat-empty">本地 usage 日志暂无逐日积分消耗（账号可能还没产生用量）</div>';
     return;
   }
   const max = Math.max.apply(null, daily.map(x => x.value || 0)) || 1;
@@ -6729,7 +6757,7 @@ async function loadCreditUsage(force){
     + '<div class="heat-wrap"><div class="heat-grid" style="margin-bottom:6px">' + grid + "</div></div>"
     + '<div class="heat-legend"><span>积分</span><i data-l="0"></i><span>0</span>'
     + '<i data-l="1"></i><i data-l="2"></i><i data-l="3"></i><i data-l="4"></i>'
-    + '<span style="margin-left:auto">官方逐日消耗（近 365 天），与上方 token 热力图口径不同</span></div>'
+    + '<span style="margin-left:auto">网关逐日积分消耗（近 365 天，来自本地 usage 日志），与上方 token 热力图口径不同</span></div>'
     + '<div class="table-wrap" style="margin-top:10px"><table class="insight-table"><thead><tr>'
     + '<th>账号</th><th style="text-align:center">区域</th>'
     + '<th style="text-align:right">累计消耗</th><th style="text-align:right">单日峰值</th>'
@@ -6859,7 +6887,7 @@ async function loadInsights(showToast){
         tip: "按近 24 小时消耗线性外推，仅供参考",
         sub: tightest ? esc(tightest.account || "") : "暂无可用速率样本" })
       + _insightCard({ icon: INSIGHT_ICONS.activity, id: "insAct", bar: "insActBar",
-        label: "签到 / 领取成功率（30 天）",
+        label: "签到 / 权益操作成功率（30 天）",
         sub: "成功 " + fmt(asum.ok) + " · 失败 " + fmt(asum.failed)
              + " · 累计积分 " + fmt(asum.earned_credits) });
 
@@ -6899,20 +6927,32 @@ function renderActivity(rows, summary){
   if(hint) hint.textContent = rows && rows.length ? ("（" + rows.length + " 条 · 30 天保留）") : "";
   if(!box) return;
   if(!rows || !rows.length){
-    box.innerHTML = _empty("还没有签到 / 领取记录，执行一次签到后这里就会出现。");
+    box.innerHTML = _empty("还没有签到 / 权益刷新记录；执行一次签到或等待自动巡检后这里就会出现。");
     return;
   }
-  const kindName = k => k === "checkin" ? "签到" : (k === "claim" ? "领取" : (k || "动作"));
+  const kindName = k => k === "checkin" ? "签到"
+    : (k === "claim" ? "领取" : (k === "refresh" ? "权益刷新" : (k || "动作")));
+  const triggerName = t => t === "startup" ? "启动"
+    : (t === "hour" || t === "schedule" ? "定时" : (t === "manual" || !t ? "手动" : t));
+  const stateBadge = r => {
+    const st = r.state || (r.ok ? "ok" : "failed");
+    if(st === "skipped") return '<span class="badge warn">跳过</span>';
+    if(st === "already") return '<span class="badge off">已签到</span>';
+    if(r.ok) return '<span class="badge ok">成功</span>';
+    return '<span class="badge bad">失败</span>';
+  };
   box.innerHTML = '<table class="insight-table"><thead><tr><th style="width:150px">时间</th>'
     + '<th style="width:80px">动作</th><th style="width:120px">账号</th>'
-    + '<th style="width:76px">结果</th><th style="text-align:right;width:80px">积分</th>'
+    + '<th style="width:76px">结果</th><th style="width:64px">触发</th>'
+    + '<th style="text-align:right;width:80px">积分</th>'
     + '<th>说明</th></tr></thead><tbody>'
     + rows.slice(0, 100).map((r, i) => {
         const ts = r.ts ? new Date(r.ts * 1000).toLocaleString() : "—";
         return '<tr' + _stagger(i) + '><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
           + '<td>' + esc(kindName(r.kind)) + '</td>'
           + '<td>' + esc(r.nickname || r.uid || "") + '</td>'
-          + '<td>' + (r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>') + '</td>'
+          + '<td>' + stateBadge(r) + '</td>'
+          + '<td style="color:var(--dim)">' + esc(triggerName(r.trigger)) + '</td>'
           + '<td style="text-align:right">' + fmt(r.amount) + '</td>'
           + '<td class="insight-detail">' + esc(r.detail || "") + '</td></tr>';
       }).join("")
@@ -6995,7 +7035,9 @@ function renderRemaining(){
         const cr = document.getElementById('schCron');
         if(cr) cr.value = s.cron || '';
         const jt = document.getElementById('schJitter');
-        if(jt) jt.value = s.jitter_secs != null ? String(s.jitter_secs) : '';
+        const checkinJitter = (s.checkin_pacing && s.checkin_pacing.jitter != null)
+          ? s.checkin_pacing.jitter : s.jitter_secs;
+        if(jt) jt.value = checkinJitter != null ? String(checkinJitter) : '';
         renderSchedDial();
       }
     }
@@ -7012,6 +7054,7 @@ async function triggerSchedulerNow(btn){
     const r = await postJSON("/scheduler/trigger", {});
     toast(r.msg || "已触发巡检保活", "ok");
     setTimeout(loadSchedulerStatus, 2000);
+    setTimeout(loadGrowthAutoStatus, 2000);
   }catch(e){
     toast("触发失败: " + e.message, "bad");
   }finally{
@@ -7024,6 +7067,7 @@ async function toggleScheduler(btn){
   try{
     const r = await postJSON("/scheduler/toggle", {});
     await loadSchedulerStatus();
+    loadGrowthAutoStatus();
     toast("后台调度器已" + (r.enabled ? "启用" : "暂停"), "ok");
   }catch(e){
     toast("切换失败: " + e.message, "bad");
@@ -8391,15 +8435,15 @@ async function doImportRefreshToken(btn){
   }
 }
 
-// 「领取全部福利」：每日签到/活动（含券类）+ Pro 福利包，一次点完（均幂等）
+// 「一键签到 + 刷新权益」：每日签到（CN）+ 权益/用量刷新（Trae 无独立福利包）
 async function runGrowthTasks(btn){
   btn.disabled = true;
   const oldText = btn.textContent;
-  btn.textContent = '领取中...';
+  btn.textContent = '执行中...';
   const logBox = document.getElementById("taskLogBox");
   if(logBox){
     logBox.style.display = 'block';
-    logBox.innerHTML = '<div style="color:var(--accent)">[福利] 正在领取全部福利（每日签到 + 限时活动 + Pro 福利包）...</div>';
+    logBox.innerHTML = '<div style="color:var(--accent)">[任务] 正在签到并刷新权益/用量...</div>';
   }
   try{
     const payload = {};
@@ -8412,16 +8456,16 @@ async function runGrowthTasks(btn){
     try{
       const t = await postJSON("/tasks/travel", payload);
       if(t && t.msg) proMsg = t.msg;
-      logs.push('--- Pro 福利包 ---');
+      logs.push('--- 权益 / 用量刷新 ---');
       (t.logs || []).forEach(l => logs.push(l));
-    }catch(e2){ logs.push('Pro 福利包领取跳过: ' + (e2 && e2.message)); }
+    }catch(e2){ logs.push('权益刷新跳过: ' + (e2 && e2.message)); }
     if(logBox){
       logBox.innerHTML = logs.map(l => '<div>' + esc(l) + '</div>').join('');
       logBox.scrollTop = logBox.scrollHeight;
     }
     await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
-    const sumC = r.credit_added != null ? ('，活动新增 +' + r.credit_added + ' 积分') : '';
-    toast("全部福利领取完成" + sumC + (proMsg ? ('；Pro: ' + proMsg.slice(0, 60)) : '') + "！");
+    const sumC = r.credit_added != null ? ('，签到新增 +' + r.credit_added + ' 积分') : '';
+    toast("签到 / 权益刷新完成" + sumC + (proMsg ? ('；' + proMsg.slice(0, 60)) : '') + "！");
   }catch(e){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
     toast("任务执行失败: " + e.message, "bad");
@@ -8432,19 +8476,19 @@ async function runGrowthTasks(btn){
 }
 
 async function triggerCatTravel(btn){
-  if(btn){ btn.disabled = true; btn.textContent = '领取中...'; }
+  if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
   try{
     const payload = {};
     if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
       payload.uid = CURRENT_GROWTH_UID;
     }
     const r = await postJSON("/tasks/travel", payload);
-    toast(r.msg || (r.ok ? "福利包领取完成" : "操作失败"), r.ok ? "ok" : "warn");
+    toast(r.msg || (r.ok ? "权益刷新完成" : "操作失败"), r.ok ? "ok" : "warn");
     await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
   }catch(e){
-    toast("福利包领取失败: " + e.message, "bad");
+    toast("权益刷新失败: " + e.message, "bad");
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '领取福利包'; }
+    if(btn){ btn.disabled = false; btn.textContent = '仅刷新权益 / 用量'; }
   }
 }
 
@@ -10565,7 +10609,9 @@ function renderHeatmap(d){
     if(legend) legend.innerHTML = "";
     return;
   }
-  const max = (d.heatmap && d.heatmap.max) || 0;
+  // 后端已返回 max；旧网关没有该字段时按本机数据兜底，避免所有格子同色。
+  const max = (d.heatmap && d.heatmap.max) ||
+    Math.max.apply(null, days.map(x => Number(x.tokens) || 0).concat([0]));
   // 365 格 × 每秒重算会明显掉帧；数据没变就直接返回（issue #98）
   const heatSum = days.reduce((a, x) => a + (x.tokens || 0), 0);
   if(!statSig("heat", [days.length, max, heatSum, days[days.length - 1] && days[days.length - 1].date])) return;
@@ -10898,7 +10944,7 @@ async function loadAnalytics(force){
   loadQuality();
   try{ renderFullPrice(statData && statData.full_price); }
   catch(e){ /* 全价请求卡失败不影响主看板 */ }
-  try{ loadCreditUsage(!!force); }catch(e){ /* 官方积分消耗失败不影响主看板 */ }
+  try{ loadCreditUsage(!!force); }catch(e){ /* 积分消耗失败不影响主看板 */ }
   try{ loadCreditsComposition(false); }catch(e){ /* 额度构成失败不影响主看板 */ }
 }
 

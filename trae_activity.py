@@ -17,8 +17,13 @@ def _path(usage_dir):
 
 
 def record(usage_dir, kind, ok, uid="", nickname="", realm="", detail="",
-           amount=0):
-    """追加一条事件；任何异常都吞掉（流水不能影响主流程）。"""
+           amount=0, state="", trigger=""):
+    """追加一条事件；任何异常都吞掉（流水不能影响主流程）。
+
+    state   成功 / 已签到 / 跳过 / 失败等更细的结论；旧行没有该字段时，
+            前端按 ok 回退。
+    trigger manual / startup / hour / schedule，面板据此区分手动与自动巡检。
+    """
     try:
         path = _path(usage_dir)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -31,11 +36,35 @@ def record(usage_dir, kind, ok, uid="", nickname="", realm="", detail="",
                "ok": bool(ok), "uid": (uid or "")[:8],
                "nickname": nickname or "", "realm": realm or "",
                "detail": str(detail or "")[:200],
-               "amount": amount or 0}
+               "amount": amount or 0,
+               "state": str(state or ""),
+               "trigger": str(trigger or "")}
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def summarize(rows):
+    """把流水行汇总成看板卡片口径（跳过不算失败）。"""
+    out = {"total": len(rows or []), "ok": 0, "failed": 0,
+           "skipped": 0, "earned_credits": 0.0}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "")
+        if state == "skipped":
+            out["skipped"] += 1
+        elif row.get("ok"):
+            out["ok"] += 1
+        else:
+            out["failed"] += 1
+        try:
+            out["earned_credits"] += float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            pass
+    out["earned_credits"] = round(out["earned_credits"], 2)
+    return out
 
 
 def recent(usage_dir, limit=200, days=KEEP_DAYS):

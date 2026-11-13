@@ -587,6 +587,153 @@ def effective_remain(value):
 
 
 # ---------------------------------------------------------------------------
+# 额度包（entitlement pack）解析
+#
+# 上游 entitlement.ent_usage.user_entitlement_pack_list 里的每个 pack 是一个
+# 「额度容器」：套餐内 / 每月奖励 / 签到资源包 / SOTA / 共享池。看板需要把
+# 它们拆开展示（账号行的额度构成、用量洞察的积分包表、/credits/summary），
+# 但旧 _credit_view 只取了第一个 pack 的 advanced_model_request_limit，导致
+# 签到包和每月奖励都看不见。这里做一层与上游字段无关的保守解析：
+#   · 只读 size / used / name / expires_at 这类可验证字段；
+#   · 读不到就跳过该容器，绝不猜数字。
+# ---------------------------------------------------------------------------
+def _credit_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pack_dicts(pack):
+    """返回 pack 里所有可能承载 quota 的 dict（按优先级）。"""
+    if not isinstance(pack, dict):
+        return []
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    extra = base.get("product_extra")
+    extra = extra if isinstance(extra, dict) else {}
+    package_extra = extra.get("package_extra")
+    package_extra = package_extra if isinstance(package_extra, dict) else {}
+    out = []
+    for candidate in (pack.get("quota"), base.get("quota"),
+                      package_extra.get("quota")):
+        if isinstance(candidate, dict):
+            out.append(candidate)
+    return out
+
+
+def _pack_size(pack):
+    """额度包面额（credits_limit / advanced_model_request_limit / ...）。"""
+    for quota in _pack_dicts(pack):
+        for key in ("credits_limit", "advanced_model_request_limit",
+                    "total_amount", "size"):
+            value = _credit_number(quota.get(key))
+            if value is not None and value > 0:
+                return value
+    return 0.0
+
+
+def _pack_used(pack):
+    """额度包已用量；上游不同产品线字段不同，读不到按 0。"""
+    usage = pack.get("usage") if isinstance(pack, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    for key in ("credits_amount", "advanced_model_request_usage",
+                "used_amount", "used", "consumed_amount"):
+        value = _credit_number(usage.get(key))
+        if value is not None and value >= 0:
+            return value
+    return 0.0
+
+
+def _pack_name(pack):
+    if not isinstance(pack, dict):
+        return ""
+    for key in ("display_desc", "group_name"):
+        value = pack.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    extra = base.get("product_extra")
+    extra = extra if isinstance(extra, dict) else {}
+    package_extra = extra.get("package_extra")
+    package_extra = package_extra if isinstance(package_extra, dict) else {}
+    for key in ("package_name", "name"):
+        value = package_extra.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return str(base.get("entitlement_id") or "").strip()
+
+
+def _pack_kind(pack, name):
+    """把上游容器映射成看板四种口径：plan / pack / sota / shared。"""
+    if not isinstance(pack, dict):
+        return "pack"
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    ident = str(base.get("entitlement_id") or "").lower()
+    label = str(name or "").lower()
+    if "sota" in label or "sota" in ident:
+        return "sota"
+    if "shared" in label or "共享" in str(name or ""):
+        return "shared"
+    try:
+        group_type = int(pack.get("group_type") or 0)
+    except (TypeError, ValueError):
+        group_type = 0
+    if group_type == 3 or "monthly" in ident or "每月" in str(name or ""):
+        return "plan"
+    return "pack"
+
+
+def _pack_expires(pack):
+    if not isinstance(pack, dict):
+        return 0
+    for key in ("expire_time", "yearly_expire_time", "next_billing_time"):
+        value = _credit_number(pack.get(key))
+        if value is not None and value > 0:
+            return int(value)
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    value = _credit_number(base.get("end_time"))
+    return int(value) if value is not None and value > 0 else 0
+
+
+def credit_composition(account):
+    """把账号的 entitlement 额度容器拆成看板可用的列表。"""
+    ent = getattr(account, "entitlement", None) or {}
+    ent = ent if isinstance(ent, dict) else {}
+    usage = ent.get("ent_usage")
+    usage = usage if isinstance(usage, dict) else {}
+    packs = usage.get("user_entitlement_pack_list") or []
+    if not isinstance(packs, list):
+        return []
+    out = []
+    for pack in packs:
+        if not isinstance(pack, dict):
+            continue
+        size = _pack_size(pack)
+        used = _pack_used(pack)
+        if size <= 0 and used <= 0:
+            continue
+        name = _pack_name(pack)
+        base = pack.get("entitlement_base_info")
+        base = base if isinstance(base, dict) else {}
+        out.append({
+            "name": name or "额度包",
+            "kind": _pack_kind(pack, name),
+            "size": round(size, 2),
+            "used": round(used, 2),
+            "remain": round(max(0.0, size - used), 2),
+            "expires_at": _pack_expires(pack),
+            "source": str(base.get("entitlement_id") or ""),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # trae_client 桥（延迟导入：trae_client 未就绪不影响本模块可用）
 # ---------------------------------------------------------------------------
 def _load_client(force=False):
@@ -1620,6 +1767,16 @@ class Account(object):
                 consumed = int(used.get("advanced_model_request_usage") or 0)
         except (TypeError, ValueError):
             limit, consumed = 0, 0
+        # 没有 usage_summary 时用额度容器回退，避免「有包但总额为 0」；
+        # summary 有总额但 consumed 缺失时，也用容器已用量补齐。
+        composition = credit_composition(account)
+        if composition:
+            comp_size = sum(float(c.get("size") or 0) for c in composition)
+            comp_used = sum(float(c.get("used") or 0) for c in composition)
+            if limit <= 0:
+                limit = comp_size
+            if consumed <= 0 and comp_used > 0:
+                consumed = comp_used
         remain = max(0, limit - consumed)
         if isinstance(remain, float):
             remain = round(remain, 2)
@@ -1635,8 +1792,11 @@ class Account(object):
             "plan": str(pack.get("display_desc") or ""),
             "remain": remain,
             "limit": limit,
+            "size": limit,
             "used": consumed,
             "total": limit,
+            "composition": composition,
+            "source": "entitlement",
             "updated_at": getattr(account, "usage_updated_at", 0) or 0,
         }
 

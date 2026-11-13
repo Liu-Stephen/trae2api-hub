@@ -26,6 +26,8 @@ jobs:
           python _test_trae.py
           python -m unittest test_issue_context test_issue_desktop test_issue_scheduling
           python test_issue_usage.py
+          python test_stats_completion.py
+          python test_checkin_activity.py
           python test_issue_http.py
           python test_issue_solo.py
           python test_issue_packaging.py

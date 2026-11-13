@@ -1,3 +1,27 @@
+## [Unreleased]
+
+### 统计页收尾
+
+- 修复 `--usage-dir` 下 `/usage/stats` 仍读默认 `usage/` 的问题：模块名 `__main__` 时懒 `import trae_proxy` 会重复执行模块级 `stats.configure()`，把运行期路径覆盖回默认目录；统计与调度器改为优先复用 `__main__`，并给 `stats.configure()` 加显式配置门闩。
+- 热力图补齐 `heatmap.max`，前端按本机峰值分级着色；旧接口缺字段时前端也会自行兜底。
+- 「本月」改为自然月 1 日 00:00，不再等同于最近 30 天。
+- 近 24 小时缓存趋势改为滚动小时桶，避免跨天时把昨天同一钟点并进今天的点。
+- `/usage/remaining`、`/accounts/credits/grants`、`/accounts/credits/usage`、`/pricing` 从硬编码空数据改为真实本地聚合；用量洞察的「积分包 / 获取记录」「最快耗尽账号」「积分消耗」恢复可用。
+- 账号额度视图补充 `size` / `composition` / `source`，账号行与 `/credits/summary` 能显示套餐内、资源包、签到包等构成。
+- `/usage/analytics` 在无输入/输出样本时把缓存命中率、推理占比返回 `None`，不再伪造成 0%。
+- 新增 `test_stats_completion.py`（38 项）覆盖上述回归。
+
+### 签到 / 权益模块收尾
+
+- 签到与权益刷新现在会写入 `usage/activity.jsonl`：成功、已签到、失败、国际版跳过、权益刷新都有记录，并带 `trigger`（手动 / 启动 / 定时）与细状态；「签到 / 权益流水」不再永远为空。
+- `/accounts/activity` 返回 `summary`（成功 / 失败 / 跳过 / 累计积分），「签到 / 权益操作成功率」卡片有真实数据。
+- Trae 没有独立 Pro 福利包接口：看板文案从「领取 Pro 福利包」改为「刷新权益 / 用量」，避免把权益刷新伪装成领取；活动/兑换码仍在官方客户端处理。
+- 签到中心新增「自动签到」状态行：显示调度是否开启、每日时刻、上次/下次巡检；调度暂停时明确提示。
+- 修复 `/scheduler/config` 404：支持自定义整点签到/保活时刻、0~1 小时窗口抖动、签到错峰；支持 `0 9,21 * * *` 这类整点 cron，非法表达式返回 400。
+- 调度器状态补齐 `checkin_times` / `keepalive_times` / `cron` / `timezone`，并持久化自定义小时。
+- `trae_tasks.usage_dir()` 优先读取 `__main__.USAGE_DIR`，`--usage-dir` 下签到流水与 `tasks.json` 不再写到默认目录。
+- 新增 `test_checkin_activity.py`（9 项）覆盖流水、汇总、自动签到触发与排程配置。
+
 ## [1.6.0] - 2026-11-12
 
 ### ✨ 新增功能

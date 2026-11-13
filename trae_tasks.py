@@ -47,6 +47,11 @@ try:                                    # 账号层是运行期依赖；缺失�
 except Exception:                       # pragma: no cover - 防御半成品仓库
     trae_accounts = None
 
+try:                                    # 签到/领取流水；缺失也不能阻断任务
+    import trae_activity
+except Exception:                       # pragma: no cover
+    trae_activity = None
+
 # ---------------------------------------------------------------------------
 # 常量与落盘位置
 # ---------------------------------------------------------------------------
@@ -116,15 +121,19 @@ def invalidate_panel_cache(uid=None):
 
 
 def usage_dir():
-    """用量目录：TRAE_PROXY_USAGE_DIR > USAGE_DIR > 已加载网关的 USAGE_DIR > 仓库/usage。"""
+    """用量目录：TRAE_PROXY_USAGE_DIR > USAGE_DIR > 运行中网关的 USAGE_DIR > 仓库/usage。"""
     value = (os.environ.get("TRAE_PROXY_USAGE_DIR")
              or os.environ.get("USAGE_DIR"))
     if value:
         return value
-    # 网关用 --usage-dir 启动时只改模块全局；这里跟随它，避免两处状态分叉
-    proxy = sys.modules.get("trae_proxy")
-    if proxy is not None:
-        proxy_dir = getattr(proxy, "USAGE_DIR", None)
+    # 网关用 --usage-dir 启动时只改模块全局；这里跟随它，避免两处状态分叉。
+    # `python trae_proxy.py` 的模块名是 __main__，必须先看它；否则会读到
+    # 仓库默认 usage/，签到流水与 tasks.json 会写到另一份目录。
+    for name in ("__main__", "trae_proxy"):
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        proxy_dir = getattr(module, "USAGE_DIR", None)
         if proxy_dir:
             return str(proxy_dir)
     return DEFAULT_USAGE_DIR
@@ -132,6 +141,22 @@ def usage_dir():
 
 def tasks_file_path():
     return os.path.join(usage_dir(), TASKS_FILE_NAME)
+
+
+def _record_activity(kind, ok, account, detail="", amount=0, state="",
+                     trigger="manual"):
+    """写一条签到 / 权益流水；任何异常都不能影响主流程。"""
+    if trae_activity is None:
+        return
+    try:
+        trae_activity.record(
+            usage_dir(), kind, ok,
+            uid=_uid_of(account), nickname=_name_of(account),
+            realm=str(getattr(account, "realm", "") or ""),
+            detail=_scrub(detail, 200), amount=amount or 0,
+            state=state, trigger=trigger or "manual")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1458,6 +1483,9 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
             logs.append("— [%s] 国际版没有每日签到接口，跳过" % name)
             snapshot[uid] = {"ok": False, "skipped": True,
                              "reason": "intl_no_checkin", "earned_credit": 0}
+            _record_activity("checkin", False, account,
+                             "国际版没有每日签到接口，跳过",
+                             state="skipped", trigger=trigger)
             continue
         if calls_made:
             delay = _pace(pacing, calls_made, waits)
@@ -1473,22 +1501,38 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
             msg = _scrub(str(exc), 200)
             logs.append("! [%s] 签到失败：%s" % (name, msg))
             snapshot[uid] = {"ok": False, "error": msg, "earned_credit": 0}
+            _record_activity("checkin", False, account,
+                             "签到失败：%s" % msg,
+                             state="failed", trigger=trigger)
             continue
         if res.get("ok"):
             if res.get("already"):
                 already += 1
                 logs.append("✓ [%s] 今日已签到（积分 %s）"
                             % (name, res.get("credits")))
+                _record_activity(
+                    "checkin", True, account,
+                    "今日已签到（积分 %s）" % (res.get("credits") or 0),
+                    state="already", trigger=trigger)
             else:
                 checked += 1
-                earned_total += int(res.get("earned_credit") or 0)
+                earned = int(res.get("earned_credit") or 0)
+                earned_total += earned
                 logs.append("✓ [%s] 签到成功，到账 +%s（积分 %s）"
-                            % (name, res.get("earned_credit") or 0,
-                               res.get("credits") or 0))
+                            % (name, earned, res.get("credits") or 0))
+                _record_activity(
+                    "checkin", True, account,
+                    "签到成功，到账 +%s（积分 %s）"
+                    % (earned, res.get("credits") or 0),
+                    amount=earned, state="ok", trigger=trigger)
         else:
             failed += 1
             logs.append("! [%s] 签到未生效：%s"
                         % (name, res.get("message") or "未知原因"))
+            _record_activity(
+                "checkin", False, account,
+                "签到未生效：%s" % (res.get("message") or "未知原因"),
+                state="failed", trigger=trigger)
         snapshot[uid] = dict(res)
         try:
             account.extra = dict(getattr(account, "extra", {}) or {})
@@ -2459,6 +2503,9 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                 "next_available_note": "", "credits": {"ok": False}}
     realm = getattr(account, "realm", "cn")
     if realm != "cn":
+        _record_activity("checkin", False, account,
+                         "国际版没有每日签到接口，跳过",
+                         state="skipped", trigger="manual")
         return {"ok": False, "logs": ["— [%s] 国际版没有每日签到接口，跳过"
                                      % _name_of(account)],
                 "earned_credit": 0, "message": "国际版没有每日签到接口",
@@ -2469,6 +2516,9 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         res = client.claim_checkin(account, realm="cn")
     except Exception as exc:                           # noqa: BLE001
         msg = _scrub(str(exc), 300)
+        _record_activity("checkin", False, account,
+                         "签到失败：%s" % msg, state="failed",
+                         trigger="manual")
         return {"ok": False, "logs": ["! 签到失败：%s" % msg],
                 "earned_credit": 0, "error": msg, "message": msg,
                 "claimed": [], "credits": {"ok": False},
@@ -2478,12 +2528,22 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     if res.get("already"):
         logs.append("✓ [%s] 今日已签到（积分 %s）"
                     % (name, res.get("credits")))
+        _record_activity("checkin", True, account,
+                         "今日已签到（积分 %s）" % (res.get("credits") or 0),
+                         state="already", trigger="manual")
     elif res.get("ok"):
+        earned = int(res.get("earned_credit") or 0)
         logs.append("✓ [%s] 签到成功，到账 +%s（积分 %s）"
-                    % (name, res.get("earned_credit") or 0,
-                       res.get("credits") or 0))
+                    % (name, earned, res.get("credits") or 0))
+        _record_activity("checkin", True, account,
+                         "签到成功，到账 +%s（积分 %s）"
+                         % (earned, res.get("credits") or 0),
+                         amount=earned, state="ok", trigger="manual")
     else:
         logs.append("! [%s] 签到未生效：%s" % (name, res.get("message") or "未知原因"))
+        _record_activity("checkin", False, account,
+                         "签到未生效：%s" % (res.get("message") or "未知原因"),
+                         state="failed", trigger="manual")
     return {
         "ok": bool(res.get("ok")),
         "logs": logs,
@@ -2530,6 +2590,9 @@ def run_batch_daily_checkin(targets, gap=1.0, inter_gap=1.5, pacing=None,
                             "message": "国际版没有每日签到接口",
                             "credits": None, "skipped": True})
             logs.append("— [%s] 国际版没有每日签到接口，跳过" % name)
+            _record_activity("checkin", False, account,
+                             "国际版没有每日签到接口，跳过",
+                             state="skipped", trigger="manual")
             continue
         if calls_made:
             delay = _pace(pacing, calls_made, waits)
@@ -2547,11 +2610,27 @@ def run_batch_daily_checkin(targets, gap=1.0, inter_gap=1.5, pacing=None,
                             "claimed": [], "earned_credit": 0,
                             "message": msg, "credits": None})
             logs.append("! [%s] 签到失败：%s" % (name, msg))
+            _record_activity("checkin", False, account,
+                             "签到失败：%s" % msg, state="failed",
+                             trigger="manual")
             continue
         earned = int(res.get("earned_credit") or 0)
         total += earned
         ok = bool(res.get("ok"))
         ok_all = ok_all and ok
+        if res.get("already"):
+            _record_activity("checkin", True, account,
+                             "今日已签到（积分 %s）" % (res.get("credits") or 0),
+                             state="already", trigger="manual")
+        elif ok:
+            _record_activity("checkin", True, account,
+                             "签到成功，到账 +%s（积分 %s）"
+                             % (earned, res.get("credits") or 0),
+                             amount=earned, state="ok", trigger="manual")
+        else:
+            _record_activity("checkin", False, account,
+                             "签到未生效：%s" % (res.get("message") or "未知原因"),
+                             state="failed", trigger="manual")
         results.append({
             "uid": uid, "nickname": name, "ok": ok,
             "claimed": [] if res.get("already") else (["每日签到"] if ok else []),
@@ -2637,15 +2716,18 @@ def run_batch_pro_claim(targets, gap=1.0, inter_gap=1.5):
         snapshot = snapshots.get(_uid_of(account)) or {}
         ent = snapshot.get("entitlement") or {}
         ok = bool(ent.get("ok"))
+        detail = (("Trae 无独立福利包；已刷新权益/用量（%s，剩余 %s）"
+                   % (ent.get("plan") or "未知套餐", ent.get("remain") or 0))
+                  if ok else "权益刷新失败")
+        _record_activity("refresh", ok, account, detail,
+                         state="ok" if ok else "failed", trigger="manual")
         results.append({
             "uid": _uid_of(account),
             "nickname": _name_of(account),
             "action": "usage_refresh",
             "ok": ok,
             "state": "refreshed" if ok else "error",
-            "msg": ("权益已刷新（%s，剩余 %s）"
-                    % (ent.get("plan") or "未知套餐", ent.get("remain") or 0))
-                   if ok else "权益刷新失败",
+            "msg": detail,
             "reward_credit": 0,
             "already_claimed": False,
         })

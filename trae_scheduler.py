@@ -23,6 +23,7 @@
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -74,6 +75,63 @@ def _env_schedule_jitter():
     return _coerce_jitter_seconds(raw)
 
 
+def _format_hours(hours):
+    return ",".join("%02d:00" % int(h) for h in sorted(set(hours)))
+
+
+def _parse_hours(value):
+    """解析 "09:00,21:00"（也接受 "9" / "09:00 / 21:00"）为整点列表。"""
+    text = str(value or "").replace("/", ",")
+    hours = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        match = re.match(r"^(\d{1,2})(?::(\d{2}))?$", part)
+        if not match:
+            raise ValueError("时间格式应为 HH:00，逗号分隔：%s" % part)
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if hour < 0 or hour > 23 or minute != 0:
+            raise ValueError("只支持整点调度：%s" % part)
+        hours.add(hour)
+    if not hours:
+        raise ValueError("至少需要一个整点时刻")
+    return sorted(hours)
+
+
+def _hours_from_cron(cron):
+    """极简 cron：只支持 "0 9,21 * * *" 这类整点小时列表。
+
+    分钟必须是 0；日/月/星期必须是 *。不支持的表达式明确报错，不静默猜。
+    """
+    fields = str(cron or "").split()
+    if len(fields) != 5:
+        raise ValueError("cron 需要 5 段：分 时 日 月 周")
+    minute, hour, dom, month, dow = fields
+    if minute not in ("0", "00"):
+        raise ValueError("目前只支持整点 cron（分钟必须为 0）")
+    if dom != "*" or month != "*" or dow != "*":
+        raise ValueError("目前只支持按小时调度（日/月/周必须为 *）")
+    hours = set()
+    for part in hour.split(","):
+        part = part.strip()
+        if part == "*":
+            hours.update(range(24))
+            continue
+        match = re.match(r"^(\d{1,2})(?:-(\d{1,2}))?$", part)
+        if not match:
+            raise ValueError("cron 小时段不支持：%s" % part)
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 0 or end > 23 or start > end:
+            raise ValueError("cron 小时越界：%s" % part)
+        hours.update(range(start, end + 1))
+    if not hours:
+        raise ValueError("cron 没有可用小时")
+    return sorted(hours)
+
+
 class Scheduler(object):
     def __init__(self, pool, state_dir=None, clock=None, rng=None,
                  schedule_jitter_seconds=None, checkin_pacing=None):
@@ -85,6 +143,10 @@ class Scheduler(object):
         self.pool = pool
         self.hours = list(SCHEDULE_HOURS)
         self.all_hours = sorted(set(self.hours))
+        self.checkin_times = _format_hours(self.hours)
+        self.keepalive_times = _format_hours(self.hours)
+        self.cron = ""
+        self.timezone = time.tzname[0] if time.tzname else ""
         self._stop_event = threading.Event()
         self._thread = None
         self._run_lock = threading.Lock()
@@ -100,6 +162,35 @@ class Scheduler(object):
         # **不写 accounts/**：账号池会把该目录下所有 JSON 当账号扫描。
         self.state_dir = state_dir or trae_tasks.usage_dir()
         state, migrated, migrated_from = self._load_state_with_legacy()
+        # 自定义整点排程（旧状态没有 hours 时保持默认 09:00 / 21:00）。
+        saved_hours = state.get("hours")
+        if isinstance(saved_hours, list):
+            try:
+                hours = sorted({int(h) for h in saved_hours
+                                if 0 <= int(h) <= 23})
+            except (TypeError, ValueError):
+                hours = []
+            if hours:
+                self.hours = hours
+        elif state.get("checkin_times") or state.get("keepalive_times"):
+            # 没有 hours 但有时刻字段（手工改过状态文件）：从时刻恢复。
+            try:
+                ch = _parse_hours(state.get("checkin_times")) \
+                    if state.get("checkin_times") else []
+                kh = _parse_hours(state.get("keepalive_times")) \
+                    if state.get("keepalive_times") else []
+                hours = sorted(set(ch) | set(kh))
+                if hours:
+                    self.hours = hours
+            except ValueError:
+                pass
+        self.all_hours = sorted(set(self.hours))
+        self.checkin_times = str(state.get("checkin_times")
+                                 or _format_hours(self.hours))
+        self.keepalive_times = str(state.get("keepalive_times")
+                                   or _format_hours(self.hours))
+        self.cron = str(state.get("cron") or "")
+        self.timezone = str(state.get("timezone") or self.timezone or "")
         self.enabled = bool(state.get("enabled", True))
         self.last_run_time = state.get("last_run_time") or None
         self.next_run_time = state.get("next_run_time") or None
@@ -241,6 +332,10 @@ class Scheduler(object):
                     "last_cycle_kind": self.last_cycle_kind,
                     "last_cycle_stats": self.last_cycle_stats,
                     "hours": list(self.hours),
+                    "checkin_times": self.checkin_times,
+                    "keepalive_times": self.keepalive_times,
+                    "cron": self.cron,
+                    "timezone": self.timezone,
                     "history": self.history[-HISTORY_LIMIT:],
                     "logs": self.logs[-LOG_LIMIT:],
                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -265,8 +360,15 @@ class Scheduler(object):
         # 日志即状态：顺带落盘，看板开关/上次运行时间在重启后仍然可见
         self._save_state()
         try:
-            import trae_proxy
-            trae_proxy.add_log_entry("[调度器] %s" % msg, tag="scheduler")
+            # `python trae_proxy.py` 时模块名是 __main__；直接 import trae_proxy
+            # 会把同一份文件再执行一遍（模块级 stats.configure 覆盖运行期路径）。
+            main_mod = sys.modules.get("__main__")
+            add_entry = getattr(main_mod, "add_log_entry", None)
+            if not callable(add_entry):
+                import trae_proxy
+                add_entry = getattr(trae_proxy, "add_log_entry", None)
+            if callable(add_entry):
+                add_entry("[调度器] %s" % msg, tag="scheduler")
         except Exception:
             pass
 
@@ -277,8 +379,9 @@ class Scheduler(object):
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        self.log("后台维护调度器已启动（每日 09:00 / 21:00 + 0~%.0f 分钟抖动 + 启动巡检）"
-                 % (self.schedule_jitter_seconds / 60.0))
+        self.log("后台维护调度器已启动（每日 %s + 0~%.0f 分钟抖动 + 启动巡检）"
+                 % (_format_hours(self.hours),
+                    self.schedule_jitter_seconds / 60.0))
 
     def stop(self):
         self._stop_event.set()
@@ -447,8 +550,29 @@ class Scheduler(object):
         return True
 
     def configure(self, schedule_jitter_seconds=None, checkin_interval=None,
-                  checkin_jitter=None):
-        """运行期调整窗口抖动/签到节流（环境变量/看板后续可直接调用）。"""
+                  checkin_jitter=None, checkin_times=None, keepalive_times=None,
+                  cron=None, timezone=None):
+        """运行期调整排程时刻 / 窗口抖动 / 签到节流。
+
+        时刻只支持整点；cron 只支持 "0 9,21 * * *" 这类小时列表（见
+        _hours_from_cron）。非法表达式抛 ValueError，由 HTTP 层转 400，
+        不静默改写用户配置。
+        """
+        new_hours = None
+        new_checkin = None
+        new_keepalive = None
+        if cron is not None and str(cron).strip():
+            new_hours = _hours_from_cron(cron)
+            new_checkin = _format_hours(new_hours)
+            new_keepalive = new_checkin
+        elif checkin_times is not None or keepalive_times is not None:
+            ch = _parse_hours(checkin_times if checkin_times is not None
+                              else self.checkin_times)
+            kh = _parse_hours(keepalive_times if keepalive_times is not None
+                              else self.keepalive_times)
+            new_hours = sorted(set(ch) | set(kh))
+            new_checkin = _format_hours(ch)
+            new_keepalive = _format_hours(kh)
         if schedule_jitter_seconds is not None:
             self.schedule_jitter_seconds = _coerce_jitter_seconds(
                 schedule_jitter_seconds)
@@ -461,12 +585,21 @@ class Scheduler(object):
                 jitter=(current["jitter"] if checkin_jitter is None
                         else checkin_jitter))
             self.checkin_pacing["source"] = "configure"
+        if new_hours:
+            self.hours = new_hours
+            self.all_hours = sorted(set(new_hours))
+            self.checkin_times = new_checkin
+            self.keepalive_times = new_keepalive
+        if cron is not None:
+            self.cron = str(cron or "").strip()
+        if timezone is not None:
+            self.timezone = str(timezone or "").strip() or self.timezone
         self._calc_next_fire()
         self._save_state()
         pacing = self._schedule_pacing_view()
-        self.log("调度配置已更新：窗口抖动 %.0fs，签到间隔 %.1fs + 抖动 %.1fs"
-                 % (self.schedule_jitter_seconds, pacing["interval"],
-                    pacing["jitter"]))
+        self.log("调度配置已更新：每日 %s，窗口抖动 %.0fs，签到间隔 %.1fs + 抖动 %.1fs"
+                 % (_format_hours(self.hours), self.schedule_jitter_seconds,
+                    pacing["interval"], pacing["jitter"]))
         return self.status()
 
     # -- 执行 ---------------------------------------------------------------
@@ -552,15 +685,19 @@ class Scheduler(object):
                     if getattr(a, "enabled", True)
                     and trae_tasks._access_token(a)]
         jitter_minutes = self.schedule_jitter_seconds / 60.0
-        mode = ("每日 09:00 / 21:00 + 0~%.0f 分钟随机抖动 + 启动巡检"
+        mode = ("每日 %s + 0~%.0f 分钟随机抖动 + 启动巡检"
                 "（Token 保活 · 权益用量 · 模型目录 · 到期提醒）"
-                % jitter_minutes)
+                % (_format_hours(self.hours), jitter_minutes))
         return {
             "enabled": self.enabled,
             "mode": mode,
             "mode_cn": mode,
             "mode_intl": mode,
             "hours": list(self.hours),
+            "checkin_times": self.checkin_times,
+            "keepalive_times": self.keepalive_times,
+            "cron": self.cron,
+            "timezone": self.timezone or (time.tzname[0] if time.tzname else ""),
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "next_run_ts": int(self.next_run_ts) if self.next_run_ts else 0,
@@ -568,6 +705,8 @@ class Scheduler(object):
             "schedule_jitter_seconds": self.schedule_jitter_seconds,
             "schedule_jitter_minutes": round(jitter_minutes, 1),
             "checkin_pacing": self._schedule_pacing_view(),
+            # 兼容看板旧字段名：这里的 jitter 是「账号之间的签到抖动」。
+            "jitter_secs": float((self.checkin_pacing or {}).get("jitter") or 0),
             "startup_claim_date": self.startup_claim_date or "",
             "startup_last_ts": self.startup_last_ts,
             "last_cycle_date": self.last_cycle_date or "",

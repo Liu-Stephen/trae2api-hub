@@ -6,6 +6,10 @@ import threading
 PREFIX = "[trae_stats]"
 _LOG_LOCK = threading.Lock()
 _logger = None
+# 是否已经被显式 configure 过。trae_proxy 在 `python trae_proxy.py` 时是
+# __main__；任何 `import trae_proxy` 都会再执行一次模块级 configure，若不加
+# 这个门闩，会把运行期 --usage-dir / 测试夹具覆盖回默认目录。
+_CONFIGURED = False
 
 
 def configure(usage_dir=None, log_path=None, summary_path=None,
@@ -20,7 +24,8 @@ def configure(usage_dir=None, log_path=None, summary_path=None,
     返回生效后的路径字典。幂等：重复调用以最后一次为准。
     """
     global USAGE_DIR, USAGE_LOG, USAGE_SUMMARY, POOL, _logger
-    global _USAGE_REPORT_CACHE
+    global _USAGE_REPORT_CACHE, _CONFIGURED
+    _CONFIGURED = True
     if usage_dir:
         USAGE_DIR = os.path.abspath(str(usage_dir))
     if log_path:
@@ -55,11 +60,21 @@ def log(msg, *args, **kwargs):
     tag = kwargs.get("tag") or "usage"
     fn = _logger
     if fn is None:
-        try:                  # 懒解析，避免与 trae_proxy 形成导入环
-            import trae_proxy
-            fn = getattr(trae_proxy, "log", None)
+        # 先看 __main__：`python trae_proxy.py` 时模块名是 __main__，
+        # 直接 `import trae_proxy` 会把同一份文件再执行一遍，模块级
+        # trae_stats.configure() 会用默认 usage 目录把运行期配置覆盖掉
+        # （--usage-dir 失效、统计读到另一份日志的根因）。
+        try:
+            main_mod = sys.modules.get("__main__")
+            fn = getattr(main_mod, "log", None)
         except Exception:
             fn = None
+        if not callable(fn):
+            try:              # 懒解析，避免与 trae_proxy 形成导入环
+                import trae_proxy
+                fn = getattr(trae_proxy, "log", None)
+            except Exception:
+                fn = None
     if callable(fn):
         try:
             with _LOG_LOCK:
@@ -88,13 +103,21 @@ def _local_day_start(ts=None):
 def _local_midnight(days_back=0):
     return _local_day_start(time.time() - days_back * 86400)
 
+def _local_month_start():
+    """本月 1 日 00:00（本地时区）。"""
+    lt = time.localtime(time.time())
+    return time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+
 def range_window(value, since=None, until=None):
     v = str(value or "").strip().lower()
     if v in ("today", "day", "1d"):
         return _local_midnight(), None
     if v in ("week", "w", "7d"):
         return _local_midnight(days_back=6), None
-    if v in ("month", "m", "30d"):
+    if v in ("month", "m"):
+        # 面板的「本月」是自然月，不是「最近 30 天」；30 天窗口保留给 30d。
+        return _local_month_start(), None
+    if v in ("30d", "30days"):
         return _local_midnight(days_back=29), None
     if v in ("all", ""):
         return None, None
@@ -233,6 +256,9 @@ def compute_usage_stats(range_val=None, since=None, until=None, heatmap_days=365
     act_days = set()
     all_days = set()
     cache_win = {"10m": [0, 0], "1h": [0, 0], "24h": [0, 0], "7d": [0, 0]}
+    # 近 24 小时按「滚动小时桶」聚合：0 = 最近 60 分钟，23 = 23~24 小时前。
+    # 旧实现按本地时钟小时累加，跨天时会把「昨天同一钟点」并进今天的点，
+    # 导致最早那个小时虚高、曲线分布失真。
     hour_cached = [0] * 24
     hour_prompt = [0] * 24
     hour_tokens = [0] * 24
@@ -281,11 +307,12 @@ def compute_usage_stats(range_val=None, since=None, until=None, heatmap_days=365
                                 cache_win[_k][0] += cached
                                 cache_win[_k][1] += prompt
                     if at >= now - 86400 and not is_err:
-                        hour = time.localtime(at).tm_hour
-                        if _cache_known:
-                            hour_cached[hour] += cached
-                            hour_prompt[hour] += prompt
-                        hour_tokens[hour] += tokens
+                        age = int((now - at) // 3600)
+                        if 0 <= age < 24:
+                            if _cache_known:
+                                hour_cached[age] += cached
+                                hour_prompt[age] += prompt
+                            hour_tokens[age] += tokens
                     if not _row_in_window(r, lo, hi):
                         continue
                     if dkey:
@@ -352,16 +379,15 @@ def compute_usage_stats(range_val=None, since=None, until=None, heatmap_days=365
 
     top_models = _rank(models)
     hours = []
-    for i in range(23, -1, -1):
-        ts = now - i * 3600
-        h = time.localtime(ts).tm_hour
-        prompt = hour_prompt[h]
-        cached = hour_cached[h]
+    for age in range(23, -1, -1):
+        ts = now - age * 3600
+        prompt = hour_prompt[age]
+        cached = hour_cached[age]
         hours.append({
             "ts": int(ts),
             "label": time.strftime("%H:00", time.localtime(ts)),
             "pct": (round(cached * 100.0 / prompt, 2) if prompt else None),
-            "tokens": hour_tokens[h],
+            "tokens": hour_tokens[age],
         })
 
     cache_rows = []
@@ -379,6 +405,9 @@ def compute_usage_stats(range_val=None, since=None, until=None, heatmap_days=365
         d = _day_key(cursor)
         heat_days.append({"date": d, "tokens": heat.get(d, 0)})
         cursor += 86400
+    # 前端按「本机峰值」分级着色；缺这个字段时所有非零格子都会落成同一档。
+    heat_max = max((int(row.get("tokens") or 0) for row in heat_days),
+                   default=0)
 
     return {
         "window": {"from": lo, "to": hi, "range": str(range_val or "all")},
@@ -412,7 +441,7 @@ def compute_usage_stats(range_val=None, since=None, until=None, heatmap_days=365
             "threshold": FULL_PRICE_PROMPT_MIN,
         },
         "hourly": {"points": hours},
-        "heatmap": {"days": heat_days},
+        "heatmap": {"days": heat_days, "max": heat_max},
     }
 
 def cached_usage_report(kind, ttl=10, **params):

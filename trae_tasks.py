@@ -1510,10 +1510,15 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
                 already += 1
                 logs.append("✓ [%s] 今日已签到（积分 %s）"
                             % (name, res.get("credits")))
-                _record_activity(
-                    "checkin", True, account,
-                    "今日已签到（积分 %s）" % (res.get("credits") or 0),
-                    state="already", trigger=trigger)
+                # 启动 / 定时巡检只是「查一下状态」，不是一次领取动作：
+                # 只有手动签到才把「今日已签到」写进流水，避免一天出现
+                # 多条「已签到」让用户误以为重复签到。真正领取（ok）/
+                # 跳过 / 失败仍然每次都记。
+                if trigger == "manual":
+                    _record_activity(
+                        "checkin", True, account,
+                        "今日已签到（积分 %s）" % (res.get("credits") or 0),
+                        state="already", trigger=trigger)
             else:
                 checked += 1
                 earned = int(res.get("earned_credit") or 0)

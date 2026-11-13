@@ -4,7 +4,7 @@
 
 覆盖：
   · 手动签到（成功 / 已签到 / 失败 / 国际版跳过）写 activity.jsonl；
-  · 调度器 task_daily_checkin 写入 trigger=startup 的流水；
+  · 调度器 task_daily_checkin 的「今日已签到」只做状态检查、不写流水（手动才写）；
   · 「刷新权益」写入 kind=refresh 的流水（Trae 没有独立福利包）；
   · 自定义整点排程 / 极简 cron 能被 Scheduler.configure 接受并持久化。
 
@@ -176,7 +176,8 @@ class ActivityTests(Base):
         self.assertFalse(row["ok"])
         self.assertIn("国际版", row["detail"])
 
-    def test_scheduler_checkin_records_startup_trigger(self):
+    def test_scheduler_checkin_skips_already_activity(self):
+        """启动/定时巡检的「今日已签到」只是状态检查，不写流水。"""
         account = FakeAccount()
         client = FakeClient(result={
             "ok": True, "already": True, "checked_in": True,
@@ -186,10 +187,42 @@ class ActivityTests(Base):
             result = trae_tasks.task_daily_checkin(
                 accounts=[account], trigger="startup", pacing=self.pacing())
         self.assertTrue(result["ok"])
+        self.assertEqual(result["stats"]["already"], 1)
+        self.assertEqual(result["stats"]["earned_credit"], 0)
+        self.assertEqual(self.rows(), [])
+
+    def test_manual_checkin_still_records_already(self):
+        """手动点击签到仍然保留「已签到」流水（用户需要看到结果）。"""
+        account = FakeAccount()
+        client = FakeClient(result={
+            "ok": True, "already": True, "checked_in": True,
+            "credits": 100, "earned_credit": 0, "message": "already",
+        })
+        with mock.patch.object(trae_tasks, "_client_module", lambda: client):
+            result = trae_tasks.task_daily_checkin(
+                accounts=[account], trigger="manual", pacing=self.pacing())
+        self.assertTrue(result["ok"])
         row = self.rows()[-1]
         self.assertEqual(row["kind"], "checkin")
         self.assertEqual(row["state"], "already")
-        self.assertEqual(row["trigger"], "startup")
+        self.assertEqual(row["trigger"], "manual")
+        self.assertEqual(row["amount"], 0)
+
+    def test_visible_rows_hides_only_auto_already(self):
+        rows = [
+            {"state": "already", "trigger": "startup", "amount": 0},
+            {"state": "already", "trigger": "hour", "amount": 0},
+            {"state": "already", "trigger": "manual", "amount": 0},
+            {"state": "ok", "trigger": "startup", "amount": 100},
+            {"state": "skipped", "trigger": "startup", "amount": 0},
+            {"state": "failed", "trigger": "startup", "amount": 0},
+        ]
+        out = trae_activity.visible_rows(rows)
+        self.assertEqual(len(out), 4)
+        self.assertNotIn("startup", [r["trigger"] for r in out
+                                     if r["state"] == "already"])
+        self.assertIn("manual", [r["trigger"] for r in out
+                                 if r["state"] == "already"])
 
     def test_pro_claim_records_refresh_not_fake_claim(self):
         account = FakeAccount()

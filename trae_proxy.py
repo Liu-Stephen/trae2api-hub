@@ -10908,6 +10908,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/activity":
             limit = int((query.get("limit") or ["200"])[0]) if query.get("limit") else 200
             rows = trae_activity.recent(USAGE_DIR, limit=limit)
+            # 启动/定时巡检的「今日已签到」只是状态检查，不是领取动作：
+            # 默认不展示（日志仍保留）；include_checks=1 可看完整审计。
+            include_checks = str(
+                (query.get("include_checks") or ["0"])[0]).lower() in (
+                    "1", "true", "yes")
+            if not include_checks:
+                rows = trae_activity.visible_rows(rows)
             return self._json(200, {"ok": True, "rows": rows,
                                     "count": len(rows),
                                     "summary": trae_activity.summarize(rows)})

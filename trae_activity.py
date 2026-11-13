@@ -45,6 +45,20 @@ def record(usage_dir, kind, ok, uid="", nickname="", realm="", detail="",
         pass
 
 
+AUTO_TRIGGERS = ("startup", "hour", "schedule")
+
+
+def visible_rows(rows):
+    """面板视图：隐藏启动 / 定时巡检的「已签到」状态检查。
+
+    这些行只是「查了一下状态：今天已经签过」，不是一次领取动作；日志
+    （activity.jsonl）仍然完整保留，需要审计时传 include_checks=1 即可。
+    """
+    return [row for row in (rows or [])
+            if not (str(row.get("state") or "") == "already"
+                    and str(row.get("trigger") or "") in AUTO_TRIGGERS)]
+
+
 def summarize(rows):
     """把流水行汇总成看板卡片口径（跳过不算失败）。"""
     out = {"total": len(rows or []), "ok": 0, "failed": 0,

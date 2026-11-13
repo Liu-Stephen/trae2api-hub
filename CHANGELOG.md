@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### 签到流水去噪
+
+- 启动 / 定时巡检的「今日已签到」只是状态检查（`claim_checkin` 先查 status，已签到直接返回 `already=True`，不会再调领取接口），不再写入 `activity.jsonl`；只有真正领取、跳过、失败才记流水。
+- 手动签到仍保留「已签到」记录；`/accounts/activity` 默认隐藏旧的启动/定时「已签到」行（日志仍完整保留，传 `include_checks=1` 可看完整审计）。
+- 新增 `test_checkin_activity.py` 回归：启动巡检不写 `already` 流水、手动仍写、面板过滤只隐藏自动检查。
+
 ### 最近请求的积分 / 积分拆分
 
 - SOLO 上游的 `token_usage` 帧实测只有 token / cache / reasoning，**没有积分字段**；因此「最近请求」的积分列现在按**账户实际消耗积分**估算：账户 entitlement 的累计 consumed ÷ 本地日志的等价花费，再按每条请求的三段（非缓存输入 / 缓存输入 / 输出）等价花费占比分摊。

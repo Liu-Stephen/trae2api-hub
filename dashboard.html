@@ -6927,7 +6927,7 @@ function renderActivity(rows, summary){
   if(hint) hint.textContent = rows && rows.length ? ("（" + rows.length + " 条 · 30 天保留）") : "";
   if(!box) return;
   if(!rows || !rows.length){
-    box.innerHTML = _empty("还没有签到 / 权益刷新记录；执行一次签到或等待自动巡检后这里就会出现。");
+    box.innerHTML = _empty("还没有签到 / 权益操作记录；执行一次签到，或发生一次真实领取 / 跳过 / 失败后这里才会出现（启动时的状态检查不记流水）。");
     return;
   }
   const kindName = k => k === "checkin" ? "签到"

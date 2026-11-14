@@ -90,16 +90,16 @@
 
 Windows：
 
-`§bat
+```bat
 start-trae2api-hub.bat
-`§
+```
 
 Linux / macOS：
 
-`§bash
+```bash
 chmod +x start-trae2api-hub.sh
 ./start-trae2api-hub.sh
-`§
+```
 
 - API Base：`http://127.0.0.1:8791/v1`
 - 看板：`http://127.0.0.1:8791/`
@@ -107,36 +107,52 @@ chmod +x start-trae2api-hub.sh
 
 ### 方式二：Docker Compose
 
-`§bash
+```bash
 git clone https://github.com/shuishuipingan/trae2api-hub.git
 cd trae2api-hub
 docker compose up -d --build
 docker compose logs -f
-`§
+```
 
 - 端口：`8791`
 - 持久化：`./accounts`（凭证 / 设置）、`./usage`（用量流水）
 - 首次以 LAN 模式启动会生成随机 API Key，打印在日志：
 
-`§bash
+```bash
 docker compose logs trae2api-hub | grep -i "api key"
-`§
+```
 
 ### 方式三：GHCR 预构建镜像
 
-`§bash
-docker pull ghcr.io/shuishuipingan/trae2api-hub:latest
+```bash
+docker pull ghcr.io/liu-stephen/trae2api-hub:latest
 
 docker run -d --name trae2api-hub --restart unless-stopped \
   -p 8791:8791 \
-  -v $(pwd)/accounts:/app/accounts \
-  -v $(pwd)/usage:/app/usage \
-  -e TZ=Asia/Shanghai \
-  ghcr.io/shuishuipingan/trae2api-hub:latest
-`§
+  -v /绝对路径/accounts:/app/accounts \
+  -v /绝对路径/usage:/app/usage \
+  ghcr.io/liu-stephen/trae2api-hub:latest
+```
 
-- 包页面：[GHCR Packages](https://github.com/shuishuipingan/trae2api-hub/pkgs/container/trae2api-hub)
-- 版本记录：[Releases](https://github.com/shuishuipingan/trae2api-hub/releases)
+- 卷路径请用绝对路径：`$(pwd)` 在 cmd 里不展开，PowerShell 下语义也不同
+- 不传 `API_KEY` 时容器以 `--lan` 启动，首次自动生成随机 Key 写入 `accounts/settings.json`，只打印一次在日志里：
+
+```bash
+docker logs trae2api-hub | grep -i "api key"
+```
+
+- 长期部署建议显式固定 `-e API_KEY=your_key`：卷丢失后 Key 会重新生成，已配置的客户端全部失效
+- 看板：`http://<宿主机IP>:8791/`，默认密码 `admin`
+- 更新（`docker run` 没有 compose 的 pull 语义，必须重建容器）：
+
+```bash
+docker pull ghcr.io/liu-stephen/trae2api-hub:latest
+docker rm -f trae2api-hub
+# 再执行上面的 docker run
+```
+
+- 包页面：[GHCR Packages](https://github.com/Liu-Stephen/trae2api-hub/pkgs/container/trae2api-hub)
+- 版本记录：[Releases](https://github.com/Liu-Stephen/trae2api-hub/releases)
 
 ---
 
@@ -144,7 +160,7 @@ docker run -d --name trae2api-hub --restart unless-stopped \
 
 ### Chat Completions
 
-`§bash
+```bash
 curl http://127.0.0.1:8791/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
@@ -153,11 +169,11 @@ curl http://127.0.0.1:8791/v1/chat/completions \
     "messages": [{"role": "user", "content": "用三句话介绍 Trae"}],
     "stream": true
   }'
-`§
+```
 
 ### OpenAI Python SDK
 
-`§python
+```python
 from openai import OpenAI
 
 client = OpenAI(
@@ -170,14 +186,14 @@ resp = client.chat.completions.create(
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
-`§
+```
 
 ### 模型列表
 
-`§bash
+```bash
 curl "http://127.0.0.1:8791/v1/models?realm=intl"
 curl "http://127.0.0.1:8791/v1/models?realm=cn"
-`§
+```
 
 ---
 
@@ -200,7 +216,7 @@ curl "http://127.0.0.1:8791/v1/models?realm=cn"
 
 官方免费额度用尽时返回 `4008 quota exceeded`，网关统一转成 **HTTP 429** + `Retry-After: 60`，不会冷却账号，也不会伪装成 4015 风控。
 
-`§http
+```http
 HTTP/1.1 429 Too Many Requests
 Retry-After: 60
 
@@ -210,13 +226,13 @@ Retry-After: 60
     "message": "Trae 免费额度已用尽（4008 quota exceeded）..."
   }
 }
-`§
+```
 
 查看剩余额度：
 
-`§bash
+```bash
 curl -H "X-Panel-Token: $PANEL_TOKEN" http://127.0.0.1:8791/quota
-`§
+```
 
 ---
 
@@ -224,7 +240,7 @@ curl -H "X-Panel-Token: $PANEL_TOKEN" http://127.0.0.1:8791/quota
 
 设置页「API Key 与出口绑定」每个 Key 支持：
 
-`§json
+```json
 {
   "name": "Cursor",
   "realm": "intl",
@@ -232,7 +248,7 @@ curl -H "X-Panel-Token: $PANEL_TOKEN" http://127.0.0.1:8791/quota
   "daily_requests": 200,
   "daily_tokens": 2000000
 }
-`§
+```
 
 - `models`：大小写不敏感，支持 `*` 通配；空 = 不限制
 - `daily_requests`：当日成功请求数；0 = 不限制
@@ -245,7 +261,7 @@ curl -H "X-Panel-Token: $PANEL_TOKEN" http://127.0.0.1:8791/quota
 
 设置页可配置：
 
-`§json
+```json
 {
   "enabled": true,
   "fallback_model": "Doubao-1.5-pro",
@@ -254,13 +270,13 @@ curl -H "X-Panel-Token: $PANEL_TOKEN" http://127.0.0.1:8791/quota
   "on_upgrade": true,
   "warn_below": 10
 }
-`§
+```
 
 触发后自动换模型/出口：
 
-`§http
+```http
 X-Trae-Degraded: Gemini-3.1-Pro-Preview -> Doubao-1.5-pro (quota)
-`§
+```
 
 - 面板顶部显示国际版额度告警
 - 账号行显示 `INTL 额度已用尽`
@@ -278,10 +294,10 @@ X-Trae-Degraded: Gemini-3.1-Pro-Preview -> Doubao-1.5-pro (quota)
 
 接口：
 
-`§http
+```http
 GET  /config/export?download=1
 POST /config/restore
-`§
+```
 
 两者都需要 **面板 token**，不接受普通 API Key。
 
@@ -311,7 +327,7 @@ POST /config/restore
 
 ## 🧱 项目结构
 
-`§text
+```text
 trae2api-hub/
 ├── trae_proxy.py          # HTTP 网关、路由、看板 API、SSE
 ├── trae_client.py         # CN / INTL 上游协议与流式解析
@@ -328,27 +344,27 @@ trae2api-hub/
 ├── docker-compose.yml
 ├── docs/img/              # 看板截图
 └── .github/workflows/     # 测试 + GHCR 多架构构建
-`§
+```
 
 ---
 
 ## 🧪 自检
 
-`§bash
+```bash
 python _test_trae.py
-`§
+```
 
 当前基线：
 
-`§text
+```text
 PASS=204  FAIL=0  SKIP=0
-`§
+```
 
 诊断：
 
-`§bash
+```bash
 python _diag_gateway.py --chat
-`§
+```
 
 ---
 

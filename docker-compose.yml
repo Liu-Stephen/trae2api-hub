@@ -1,7 +1,7 @@
 services:
   trae2api-hub:
     # 从源码构建本地镜像；也可改成 GHCR 预构建镜像：
-    #   image: ghcr.io/<owner>/trae2api-hub:latest
+    #   image: ghcr.io/liu-stephen/trae2api-hub:latest
     image: trae2api-hub:latest
     build:
       context: .

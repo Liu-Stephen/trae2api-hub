@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### 签到到账记录不被巡检覆盖
+
+- 修复「今日已签到」巡检把当天到账记录冲回 `+0`：`task_daily_checkin` 在 `already=True` 时保留原有的 `earned_credit` / `earned_source` / `balance` 与真实签到时间 `at`，只更新 `checked_in` / `credits` 这类状态字段。此前无条件的 `account.extra["checkin"] = {...}` 会用 `claim_checkin` already 分支的 `earned_credit=0` 覆盖，导致每次巡检都把真实到账额（以及 `at`）改回「到账 0」—— 等于把「签到到账 +0」的修复原地抵消。
+- 新增 `test_checkin_earned.py` 两个回归：已签到巡检保留原记录（含 `at` 与前后余额快照）、真实领取覆盖旧记录并刷新时间。
+
 ### 账号积分更新时间
 
 - 修复账号页「更新于 未知」：`Account.public()` 现在直接下发 `creditsUpdatedIso`（来自 `usage_updated_at`），面板不再读一个从未赋值的字段。

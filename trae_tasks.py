@@ -1559,12 +1559,29 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
         snapshot[uid] = dict(res)
         try:
             account.extra = dict(getattr(account, "extra", {}) or {})
+            # 「今日已签到」只是一次状态查询，不是一次领取动作：claim_checkin 在
+            # already 分支返回 earned_credit=0 / earned_source="already"，直接落盘
+            # 会把今天真正的到账记录（以及真实签到时间 at）冲成「到账 0」—— 巡检
+            # 每跑一次就冲一次，等于把本次修复又改回原样。所以 already 时保留原记录，
+            # 只更新 checked_in / credits 这类状态字段。
+            prev = account.extra.get("checkin")
+            prev = prev if isinstance(prev, dict) else {}
+            if res.get("already"):
+                earned = prev.get("earned_credit") or 0
+                source = prev.get("earned_source") or "already"
+                balance = prev.get("balance") or {}
+                at = prev.get("at") or _iso()
+            else:
+                earned = res.get("earned_credit") or 0
+                source = res.get("earned_source") or ""
+                balance = res.get("balance") or {}
+                at = _iso()
             account.extra["checkin"] = {
-                "at": _iso(), "checked_in": bool(res.get("checked_in")),
-                "credits": res.get("credits"), "earned_credit": res.get("earned_credit") or 0,
+                "at": at, "checked_in": bool(res.get("checked_in")),
+                "credits": res.get("credits"), "earned_credit": earned,
                 # 记账来源与前后余额快照：以后复盘「到账多少、凭什么算的」不用再猜
-                "earned_source": res.get("earned_source") or "",
-                "balance": res.get("balance") or {},
+                "earned_source": source,
+                "balance": balance,
             }
         except Exception:
             pass

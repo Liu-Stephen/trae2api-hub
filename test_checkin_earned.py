@@ -265,6 +265,14 @@ class TaskLogWordingTests(unittest.TestCase):
             return trae_tasks.task_daily_checkin(
                 accounts=[FakeAccount()], trigger=trigger, pacing=pacing)
 
+    def run_task_with(self, client, account, trigger="startup"):
+        pacing = trae_tasks.make_pacing("checkin", interval=0, jitter=0,
+                                        sleep=lambda _s: None)
+        with mock.patch.object(trae_tasks, "_client_module", lambda: client):
+            result = trae_tasks.task_daily_checkin(
+                accounts=[account], trigger=trigger, pacing=pacing)
+        return result, account
+
     def test_unknown_amount_is_not_printed_as_zero(self):
         client = FakeClient({
             "ok": True, "already": False, "checked_in": True, "credits": 100,
@@ -286,6 +294,54 @@ class TaskLogWordingTests(unittest.TestCase):
         self.assertEqual(result["stats"]["earned_credit"], 100)
         self.assertEqual(result["stats"]["earned_unknown"], 0)
         self.assertEqual(result["stats"]["earned_sources"], {"reward": 1})
+
+    def test_already_poll_keeps_recorded_earned(self):
+        """已签到的巡检不能把今天的到账记录冲回 0。
+
+        线上巡检会反复调用 claim_checkin，already 分支返回 earned_credit=0，
+        旧实现直接落盘 —— 每次巡检都把「到账 +100」改成「到账 0」，等于把
+        本次修复原地抵消，且把真实签到时间 at 换成巡检时间。
+        """
+        account = FakeAccount()
+        account.extra = {"checkin": {
+            "at": "2026-11-14 20:31:28", "checked_in": True, "credits": 100,
+            "earned_credit": 100, "earned_source": "checkin_pack",
+            "balance": {"before": {"checkin_packs": 500.0},
+                        "after": {"checkin_packs": 600.0}}}}
+        client = FakeClient({
+            "ok": True, "already": True, "checked_in": True, "credits": 100,
+            "earned_credit": 0, "earned_source": "already",
+            "balance": {"before": None, "after": None},
+            "message": "今日已签到（积分 100）"})
+        result, account = self.run_task_with(client, account)
+        ck = account.extra["checkin"]
+        self.assertEqual(ck["earned_credit"], 100)
+        self.assertEqual(ck["earned_source"], "checkin_pack")
+        self.assertEqual(ck["at"], "2026-11-14 20:31:28")
+        self.assertEqual(ck["balance"]["after"]["checkin_packs"], 600.0)
+        self.assertEqual(ck["checked_in"], True)
+        # 不是新领取：不计入本次巡检的到账合计
+        self.assertEqual(result["stats"]["earned_credit"], 0)
+
+    def test_fresh_claim_overwrites_stale_record(self):
+        """真实领取要覆盖旧记录：到账额、来源、签到时间都取本次结果。"""
+        account = FakeAccount()
+        account.extra = {"checkin": {
+            "at": "2026-11-13 09:00:00", "checked_in": True, "credits": 100,
+            "earned_credit": 100, "earned_source": "checkin_pack",
+            "balance": {}}}
+        client = FakeClient({
+            "ok": True, "already": False, "checked_in": True, "credits": 100,
+            "earned_credit": 100, "earned_source": "checkin_pack",
+            "balance": {"before": {"checkin_packs": 600.0},
+                        "after": {"checkin_packs": 700.0}}})
+        result, account = self.run_task_with(client, account)
+        ck = account.extra["checkin"]
+        self.assertEqual(ck["earned_credit"], 100)
+        self.assertEqual(ck["earned_source"], "checkin_pack")
+        self.assertNotEqual(ck["at"], "2026-11-13 09:00:00")
+        self.assertEqual(ck["balance"]["after"]["checkin_packs"], 700.0)
+        self.assertEqual(result["stats"]["earned_credit"], 100)
 
 
 if __name__ == "__main__":

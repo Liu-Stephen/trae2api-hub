@@ -1918,11 +1918,20 @@ def account_fetch_credits(account):
                         if not isinstance(extra, dict):
                             extra = {}
                             account.extra = extra
+                        # 这里只是「查一下状态」，不是一次领取动作：
+                        #   · at / earned_credit / earned_source 由签到任务写，
+                        #     刷新权益不能把它们清零（否则面板永远显示「到账 0」）；
+                        #   · 本次读取时间单独放 status_at。
+                        prev = extra.get("checkin")
+                        prev = prev if isinstance(prev, dict) else {}
                         extra["checkin"] = {
-                            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "at": prev.get("at") or "",
+                            "status_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "checked_in": bool(st.get("checked_in")),
                             "credits": int(st.get("credits") or 0),
-                            "earned_credit": 0,
+                            "earned_credit": prev.get("earned_credit") or 0,
+                            "earned_source": prev.get("earned_source") or "",
+                            "balance": prev.get("balance") or {},
                         }
                 except Exception as exc:
                     errors.append("checkin_status: %s" % str(exc)[:160])
@@ -12244,6 +12253,7 @@ class Handler(BaseHTTPRequestHandler):
                     "nickname": account_label(account),
                     "ok": bool(res.get("ok")),
                     "earned_credit": res.get("earned_credit") or 0,
+                    "earned_source": res.get("earned_source") or "",
                     "msg": (res.get("logs") or [""])[-1],
                     "logs": res.get("logs") or [],
                     "credits": res.get("credits"),

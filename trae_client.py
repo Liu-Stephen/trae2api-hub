@@ -1329,14 +1329,168 @@ def checkin_status(account, realm=None, timeout=30):
     return data
 
 
+CHECKIN_PACK_HINT = "签到"
+
+
+def _num(value):
+    """宽松取数；bool / None / 非数字一律 None（绝不把「读不到」当 0）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pack_quotas(pack):
+    """额度包里的 quota 候选位置（上游字段层级不统一，实测三种都存在）。
+
+    线上 CN 实测：`credits_limit` 挂在 `entitlement_base_info.quota` 与
+    `entitlement_base_info.product_extra.package_extra.quota` 上，
+    包本身顶层的 `quota` 反而是 null。
+    """
+    if not isinstance(pack, dict):
+        return []
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    extra = base.get("product_extra")
+    extra = extra if isinstance(extra, dict) else {}
+    package_extra = extra.get("package_extra")
+    package_extra = package_extra if isinstance(package_extra, dict) else {}
+    out = []
+    for candidate in (pack.get("quota"), base.get("quota"),
+                      package_extra.get("quota")):
+        if isinstance(candidate, dict):
+            out.append(candidate)
+    return out
+
+
+def _credit_snapshot(account, realm=None, timeout=30):
+    """签到到账判定用的三个量（每个都可能是 None = 读不到）：
+
+      · checkin_packs：「签到奖励」额度包 credits_limit 之和。这是**面额**，
+        不随消耗变化，是「本次签到到底发了多少」最干净的直接证据；
+      · balance：总余额（total_balance，缺失时退化为 balance_summary 之和）；
+      · consumed：已消耗（usage_summary.consumed_amount），用来把余额增量里
+        被并发消耗吃掉的误差补回来（余额 = 总额 - 已消耗）。
+
+    权益接口失败时整体返回 None 值，绝不抛错拖垮签到主流程。
+    """
+    empty = {"checkin_packs": None, "balance": None, "consumed": None}
+    try:
+        ent = fetch_entitlement(account, realm, timeout=timeout)
+    except Exception:                                  # noqa: BLE001
+        return empty
+    usage = ent.get("ent_usage") if isinstance(ent, dict) else None
+    if not isinstance(usage, dict):
+        return empty
+    packs_total = 0.0
+    packs_found = False
+    for pack in usage.get("user_entitlement_pack_list") or []:
+        if not isinstance(pack, dict):
+            continue
+        name = str(pack.get("display_desc") or pack.get("name")
+                   or pack.get("group_name") or "")
+        if CHECKIN_PACK_HINT not in name:
+            continue
+        size = None
+        for quota in _pack_quotas(pack):
+            size = _num(quota.get("credits_limit"))
+            if size is not None:
+                break
+        if size is None:
+            continue
+        packs_total += size
+        packs_found = True
+    balance = _num(usage.get("total_balance"))
+    if balance is None:
+        total = 0.0
+        found = False
+        for row in usage.get("balance_summary") or []:
+            if isinstance(row, dict):
+                value = _num(row.get("total_balance"))
+                if value is not None:
+                    total += value
+                    found = True
+        balance = total if found else None
+    summary = usage.get("usage_summary")
+    summary = summary if isinstance(summary, dict) else {}
+    return {"checkin_packs": packs_total if packs_found else None,
+            "balance": balance,
+            "consumed": _num(summary.get("consumed_amount"))}
+
+
+def _snapshot_delta(before, after, key):
+    """两次快照的增量；任一未知返回 None（不猜）。"""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    old, new = before.get(key), after.get(key)
+    if old is None or new is None:
+        return None
+    return float(new) - float(old)
+
+
+def _reward_amount(*statuses):
+    """上游声明的「本次签到奖励额」（extra_credits 优先，其次 credits）。"""
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        for key in ("extra_credits", "credits"):
+            value = _num(status.get(key))
+            if value is not None and value > 0:
+                return value
+    return 0.0
+
+
+def _resolve_earned(before, after, snap_before, snap_after, confirmed):
+    """算出真实到账 + 来源标记，回答「这次签到到底加了多少分」。
+
+    优先级（越靠前越可信）：
+      1. checkin_pack：签到包面额增量。面额不受消耗影响，是发放量的直接证据；
+      2. balance_diff：Δbalance + Δconsumed。余额增量会被签到期间的流量扣费
+         吃掉一部分，补回消耗增量才是真实到账；并且只有在「补回后不低于上游
+         声明的奖励额」时才采信，低于说明有未结算消耗，退回声明值，不虚报；
+      3. reward：上游声明的奖励额，仅在签到已被确认（checked_in 翻 true 且
+         code==0）时使用 —— 绝不因为「读不到」就报 0；
+      4. unknown：拿不到任何信号，上层文案写「金额未知」而不是「+0」。
+    """
+    pack_delta = _snapshot_delta(snap_before, snap_after, "checkin_packs")
+    if pack_delta is not None and pack_delta > 0:
+        return int(round(pack_delta)), "checkin_pack"
+    reward = _reward_amount(after, before)
+    balance_delta = _snapshot_delta(snap_before, snap_after, "balance")
+    consumed_delta = _snapshot_delta(snap_before, snap_after, "consumed")
+    adjusted = None
+    if balance_delta is not None:
+        adjusted = balance_delta + (consumed_delta or 0.0)
+    # 余额是浮点（1006.35 这种），比较必须留容差，否则 99.99999 会被判成
+    # 「低于声明值」而白白丢掉真实信号。
+    trustworthy = (adjusted is not None and adjusted > 0
+                   and (reward <= 0 or adjusted + 0.01 >= reward))
+    if trustworthy:
+        return int(round(adjusted)), "balance_diff"
+    if confirmed and reward > 0:
+        return int(round(reward)), "reward"
+    if adjusted is not None and adjusted > 0:
+        return int(round(adjusted)), "balance_diff"
+    return 0, "unknown"
+
+
 def claim_checkin(account, realm=None, timeout=30):
     """领取每日签到；返回统一结构：
 
       {"ok": bool, "checked_in": bool, "already": bool,
-       "credits": int, "earned_credit": int, "message": str, "raw": {...}}
+       "credits": int, "earned_credit": int, "earned_source": str,
+       "balance": {"before": {...}, "after": {...}},
+       "message": str, "raw": {"before": {...}, "claim": {...}, "status": {...}}}
 
-    幂等：已签到直接返回 already=True，不重复领取；领取后再查一次状态，
-    用 credits 差额计算真实到账，绝不把「接口 200」当成「已到账」。
+    幂等：已签到直接返回 already=True，不重复领取；领取前后各取一次权益
+    快照，用「签到包面额增量 → 余额增量(+消耗校正) → 上游声明奖励额」算出
+    真实到账，绝不把「接口 200」当成「已到账」。
+
+    ⚠ 不要用 checkin_status 的 credits 做差值：那是「每日签到奖励额」常量
+    （实测恒为 100，与 extra_credits 同值），不随领取增长，两边一减永远 0
+    —— 线上「签到成功，到账 +0」就是它造成的（积分其实已经到账）。
     """
     account = _as_mapping(account)
     realm = normalize_realm(realm or realm_of(account))
@@ -1345,24 +1499,29 @@ def claim_checkin(account, realm=None, timeout=30):
         return {"ok": True, "checked_in": True, "already": True,
                 "credits": int(before.get("credits") or 0),
                 "earned_credit": 0,
+                "earned_source": "already",
+                "balance": {"before": None, "after": None},
                 "message": "今日已签到（积分 %s）" % int(before.get("credits") or 0),
-                "raw": before}
+                "raw": {"before": before}}
+    snapshot_before = _credit_snapshot(account, realm, timeout=timeout)
     body = {"req_source": _checkin_req_source(realm)}
     raw = request_json(account, realm, PATH_CHECKIN_CLAIM, body, base="ug",
                        timeout=timeout)
     after = checkin_status(account, realm, timeout=timeout)
-    before_credits = int(before.get("credits") or 0)
-    after_credits = int(after.get("credits") or 0)
-    earned = max(0, after_credits - before_credits)
+    snapshot_after = _credit_snapshot(account, realm, timeout=timeout)
     ok = bool(after.get("checked_in")) and (not isinstance(raw, dict)
                                             or raw.get("code") in (0, None))
+    earned, earned_source = _resolve_earned(before, after, snapshot_before,
+                                            snapshot_after, ok)
     return {"ok": ok, "checked_in": bool(after.get("checked_in")),
-            "already": False, "credits": after_credits,
+            "already": False, "credits": int(after.get("credits") or 0),
             "earned_credit": earned,
-            "message": (("签到成功（积分 %s）" % after_credits) if ok
+            "earned_source": earned_source,
+            "balance": {"before": snapshot_before, "after": snapshot_after},
+            "message": (("签到成功（积分 %s）" % int(after.get("credits") or 0)) if ok
                         else (after.get("message") or (raw or {}).get("message")
                               or "签到未生效")),
-            "raw": {"claim": raw, "status": after}}
+            "raw": {"before": before, "claim": raw, "status": after}}
 
 
 def generate_temp_token(account, realm=None, timeout=30):

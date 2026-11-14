@@ -159,6 +159,18 @@ def _record_activity(kind, ok, account, detail="", amount=0, state="",
         pass
 
 
+def _earned_view(res):
+    """把 claim_checkin 的结果翻成（计入总和的到账额, 文案片段, 是否金额未知）。
+
+    金额未知时绝不能打印「到账 +0」—— 那会被读成「积分没到账」，而实际上
+    只是这次拿不到可信信号（权益接口失败 / 上游还没结算）。
+    """
+    earned = int(res.get("earned_credit") or 0)
+    if str(res.get("earned_source") or "") == "unknown":
+        return 0, "已到账（金额未知）", True
+    return earned, "到账 +%d" % earned, False
+
+
 # ---------------------------------------------------------------------------
 # 通用小工具
 # ---------------------------------------------------------------------------
@@ -1469,6 +1481,8 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
     logs = []
     checked = already = failed = skipped = 0
     earned_total = 0
+    earned_unknown = 0
+    earned_sources = {}
     snapshot = {}
     if client is None:
         return {"ok": False, "logs": ["! trae_client 不可用，无法签到"],
@@ -1521,14 +1535,18 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
                         state="already", trigger=trigger)
             else:
                 checked += 1
-                earned = int(res.get("earned_credit") or 0)
-                earned_total += earned
-                logs.append("✓ [%s] 签到成功，到账 +%s（积分 %s）"
-                            % (name, earned, res.get("credits") or 0))
+                earned, earned_text, unknown = _earned_view(res)
+                source = str(res.get("earned_source") or "") or "unknown"
+                earned_sources[source] = earned_sources.get(source, 0) + 1
+                if unknown:
+                    earned_unknown += 1
+                else:
+                    earned_total += earned
+                detail = ("签到成功，%s（积分 %s）"
+                          % (earned_text, res.get("credits") or 0))
+                logs.append("✓ [%s] %s" % (name, detail))
                 _record_activity(
-                    "checkin", True, account,
-                    "签到成功，到账 +%s（积分 %s）"
-                    % (earned, res.get("credits") or 0),
+                    "checkin", True, account, detail,
                     amount=earned, state="ok", trigger=trigger)
         else:
             failed += 1
@@ -1544,15 +1562,23 @@ def task_daily_checkin(pool=None, accounts=None, trigger="manual",
             account.extra["checkin"] = {
                 "at": _iso(), "checked_in": bool(res.get("checked_in")),
                 "credits": res.get("credits"), "earned_credit": res.get("earned_credit") or 0,
+                # 记账来源与前后余额快照：以后复盘「到账多少、凭什么算的」不用再猜
+                "earned_source": res.get("earned_source") or "",
+                "balance": res.get("balance") or {},
             }
         except Exception:
             pass
     ok = failed == 0
     finished = time.time()
+    earned_text = str(earned_total)
+    if earned_unknown:
+        earned_text = "%s（另有 %d 笔金额未知）" % (earned_total, earned_unknown)
     summary = ("每日签到：新签 %d，已签 %d，跳过 %d，失败 %d，到账 %s"
-               % (checked, already, skipped, failed, earned_total))
+               % (checked, already, skipped, failed, earned_text))
     stats = {"checked": checked, "already": already, "failed": failed,
              "skipped": skipped, "earned_credit": earned_total,
+             "earned_unknown": earned_unknown,
+             "earned_sources": earned_sources,
              "partial": failed > 0,
              "paced_seconds": round(paced_seconds, 3),
              "waits": waits[-20:],
@@ -2537,12 +2563,11 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                          "今日已签到（积分 %s）" % (res.get("credits") or 0),
                          state="already", trigger="manual")
     elif res.get("ok"):
-        earned = int(res.get("earned_credit") or 0)
-        logs.append("✓ [%s] 签到成功，到账 +%s（积分 %s）"
-                    % (name, earned, res.get("credits") or 0))
-        _record_activity("checkin", True, account,
-                         "签到成功，到账 +%s（积分 %s）"
-                         % (earned, res.get("credits") or 0),
+        earned, earned_text, _unknown = _earned_view(res)
+        detail = ("签到成功，%s（积分 %s）"
+                  % (earned_text, res.get("credits") or 0))
+        logs.append("✓ [%s] %s" % (name, detail))
+        _record_activity("checkin", True, account, detail,
                          amount=earned, state="ok", trigger="manual")
     else:
         logs.append("! [%s] 签到未生效：%s" % (name, res.get("message") or "未知原因"))
@@ -2553,6 +2578,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         "ok": bool(res.get("ok")),
         "logs": logs,
         "earned_credit": int(res.get("earned_credit") or 0),
+        "earned_source": res.get("earned_source") or "",
         "credits": {"ok": True, "remain": res.get("credits") or 0,
                     "size": None},
         "campaign": None,
@@ -2619,7 +2645,7 @@ def run_batch_daily_checkin(targets, gap=1.0, inter_gap=1.5, pacing=None,
                              "签到失败：%s" % msg, state="failed",
                              trigger="manual")
             continue
-        earned = int(res.get("earned_credit") or 0)
+        earned, earned_text, _unknown = _earned_view(res)
         total += earned
         ok = bool(res.get("ok"))
         ok_all = ok_all and ok
@@ -2629,8 +2655,8 @@ def run_batch_daily_checkin(targets, gap=1.0, inter_gap=1.5, pacing=None,
                              state="already", trigger="manual")
         elif ok:
             _record_activity("checkin", True, account,
-                             "签到成功，到账 +%s（积分 %s）"
-                             % (earned, res.get("credits") or 0),
+                             "签到成功，%s（积分 %s）"
+                             % (earned_text, res.get("credits") or 0),
                              amount=earned, state="ok", trigger="manual")
         else:
             _record_activity("checkin", False, account,
@@ -2640,15 +2666,16 @@ def run_batch_daily_checkin(targets, gap=1.0, inter_gap=1.5, pacing=None,
             "uid": uid, "nickname": name, "ok": ok,
             "claimed": [] if res.get("already") else (["每日签到"] if ok else []),
             "earned_credit": earned,
+            "earned_source": res.get("earned_source") or "",
             "credits": res.get("credits"),
             "already": bool(res.get("already")),
             "checked_in": bool(res.get("checked_in")),
             "message": res.get("message") or "",
         })
         logs.append(("✓ [%s] 今日已签到（积分 %s）" if res.get("already")
-                     else "✓ [%s] 签到成功，到账 +%s（积分 %s）")
+                     else "✓ [%s] 签到成功，%s（积分 %s）")
                     % ((name, res.get("credits")) if res.get("already")
-                       else (name, earned, res.get("credits"))))
+                       else (name, earned_text, res.get("credits"))))
     pacing_info = pacing_view(pacing)
     pacing_info["source"] = pacing_source
     return {"ok": ok_all, "results": results, "logs": logs,

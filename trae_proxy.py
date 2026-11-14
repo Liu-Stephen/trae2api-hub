@@ -1736,6 +1736,19 @@ def recent_usage(limit=100, realm=None, page=1):
     for row in page_rows:
         if row.get("error"):
             continue        # 失败行没有出账区，不估积分（前端也显示 —）
+        # 旧行没有档位字段：按模型目录的默认档回填，面板显示「服务端默认」。
+        # 有 requested/effort 键的行（含显式空串）一律保留原语义。
+        if "reasoning_effort_requested" not in row \
+                and "reasoning_effort" not in row:
+            try:
+                meta = catalog_meta_for(
+                    row.get("model"), row.get("realm") or "cn")
+                default = (meta.get("reasoning_effort_config") or {}).get(
+                    "default_level")
+            except Exception:
+                default = None
+            if default:
+                row["reasoning_effort"] = str(default)
         info = _row_credit(row, factors, overrides=overrides)
         if info["estimated"]:
             row["credit"] = round(info["credit"], 6)
@@ -1917,7 +1930,10 @@ def account_fetch_credits(account):
         account.usage = raw_usage
     if isinstance(raw_ent, dict):
         account.entitlement = raw_ent
-    account.usage_updated_at = time.time()
+    # 「更新于」必须是**最后成功刷新**的时间：两个接口都失败时保留旧时间戳，
+    # 否则面板会把一次失败尝试显示成刚更新过。
+    if isinstance(raw_usage, dict) or isinstance(raw_ent, dict):
+        account.usage_updated_at = time.time()
     try:
         account.save()
     except Exception as exc:
@@ -7042,6 +7058,32 @@ SOLO_CHAT_URL = os.environ.get(
 SOLO_READ_TIMEOUT = float(os.environ.get("TRAE_SOLO_READ_TIMEOUT", "180") or 180)
 
 
+def _solo_effort(payload, model):
+    """请求档位 -> (requested, normalized, field)。
+
+    field：内置 Trae 模型用 reasoning_effort_level，外部/自定义模型用
+    reasoning_effort（与 raw_chat 的 build_trae_body 同一套选择规则）。
+    normalized=None 表示该模型没有档位表 / 归一化后不该下发。
+    """
+    requested = requested_effort(payload)
+    if not requested:
+        return None, None, None
+    try:
+        meta = catalog_meta_for(model, "cn")
+    except Exception:
+        meta = {}
+    norm, note = normalize_reasoning_effort(requested, meta)
+    if note:
+        log("solo reasoning_effort %s on '%s' (supported=%s)"
+            % (note, model, supported_efforts(meta)), tag="chat")
+    if not norm:
+        return requested, None, None
+    custom = bool(meta.get("provider")
+                  or meta.get("config_source") not in (None, 1))
+    return requested, norm, ("reasoning_effort" if custom
+                             else "reasoning_effort_level")
+
+
 def _solo_body(payload, model, messages, tools):
     """SOLO 上游 body（字段与官方客户端一致；max_tokens 不再写死 100 万）。"""
     max_tokens = payload.get("max_tokens")
@@ -7061,6 +7103,15 @@ def _solo_body(payload, model, messages, tools):
     }
     if tools:
         body["tools"] = tools
+    effort = payload.get("_solo_effort")
+    field = payload.get("_solo_effort_field")
+    if effort and field:
+        body[field] = effort
+    elif requested_effort(payload):
+        # 直接调用 trae_solo_chat（账号测试等）时没有预计算值，这里补一次。
+        _req, _norm, _field = _solo_effort(payload, model)
+        if _norm:
+            body[_field] = _norm
     return body
 
 
@@ -11751,6 +11802,20 @@ class Handler(BaseHTTPRequestHandler):
         chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
 
+        # 思考档位：客户端请求了才下发；没请求时记录模型默认档，
+        # 面板据此显示「服务端默认」而不是「—」。
+        effort_requested, effort, effort_field = _solo_effort(payload, model)
+        if not effort_requested:
+            try:
+                _meta = catalog_meta_for(model, "cn")
+                _default = (_meta.get("reasoning_effort_config") or {}).get(
+                    "default_level")
+            except Exception:
+                _default = None
+            if _default:
+                effort = str(_default)
+                effort_field = None
+
         def chunk(delta, finish=None, usage=None):
             frame = {"id": chunk_id, "object": "chat.completion.chunk",
                      "created": created, "model": model, "choices": []}
@@ -11826,6 +11891,9 @@ class Handler(BaseHTTPRequestHandler):
             if trae_token_expired(acc):
                 trae_refresh_account(acc, "cn")
             call_payload = dict(payload, model=model)
+            if effort and effort_field:
+                call_payload["_solo_effort"] = effort
+                call_payload["_solo_effort_field"] = effort_field
             first_at[0] = None      # 换号重试后重新计首字（started 仍是请求起点）
             try:
                 if want_stream:
@@ -11855,7 +11923,8 @@ class Handler(BaseHTTPRequestHandler):
                         record_usage(
                             model, None, stream=True,
                             elapsed_ms=wall, ttft_ms=ttft_ms, gen_ms=gen_ms,
-                            account=acc.uid,
+                            account=acc.uid, effort=effort,
+                            effort_requested=effort_requested,
                             key_id=self._key_id_for_usage(),
                             fp=fp, request_id=request_id)
                     except Exception:
@@ -11913,7 +11982,9 @@ class Handler(BaseHTTPRequestHandler):
         wall, ttft_ms, gen_ms = timing()
         record_usage(model, usage, stream=want_stream,
                      elapsed_ms=wall, ttft_ms=ttft_ms, gen_ms=gen_ms,
-                     account=account.uid, key_id=self._key_id_for_usage(),
+                     account=account.uid, effort=effort,
+                     effort_requested=effort_requested,
+                     key_id=self._key_id_for_usage(),
                      fp=fp, request_id=request_id)
 
         if want_stream:

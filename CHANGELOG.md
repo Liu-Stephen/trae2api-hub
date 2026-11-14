@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+### 账号积分更新时间
+
+- 修复账号页「更新于 未知」：`Account.public()` 现在直接下发 `creditsUpdatedIso`（来自 `usage_updated_at`），面板不再读一个从未赋值的字段。
+- 「更新于」只记录**最后成功刷新**：`account_fetch_credits` 在 usage / entitlement 两个接口都失败时保留旧时间戳，不把失败尝试伪装成刚更新。
+- `test_stats_completion.py` 增加 `creditsUpdatedIso` 19 位 ISO 串回归。
+
+### 最近请求的档位列
+
+- SOLO 通道现在会把客户端的 `reasoning_effort` 归一化后以 `reasoning_effort_level` 下发给上游，并同时落盘 `reasoning_effort_requested` / `reasoning_effort`；「最近请求」的档位列不再为空。
+- 客户端没指定档位时，按模型目录的 `default_level` 回填实际档位，面板显示「服务端默认」；历史行读取时同样补默认档，不改写日志。
+- 新增 `test_issue_solo.py [2c]`：验证 requested/actual 落盘与 SOLO 下发字段。
+
 ### 签到流水去噪
 
 - 启动 / 定时巡检的「今日已签到」只是状态检查（`claim_checkin` 先查 status，已签到直接返回 `already=True`，不会再调领取接口），不再写入 `activity.jsonl`；只有真正领取、跳过、失败才记流水。

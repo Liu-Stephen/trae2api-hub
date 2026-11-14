@@ -1881,6 +1881,11 @@ class Account(object):
             "intlQuotaState": self._intl_quota_state(
                 (self.extra or {}).get("intl_quota")),
             "usageUpdatedAt": self.usage_updated_at or None,
+            # 面板「更新于」直接读这个 ISO 串；没有成功刷新过就是空串。
+            "creditsUpdatedIso": (
+                time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(self.usage_updated_at))
+                if self.usage_updated_at else ""),
             "file": os.path.basename(self.path or ""),
         }
 

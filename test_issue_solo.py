@@ -6,6 +6,7 @@
       requests+1；usage_missing=True（不伪造 0 命中）
   [2] 成功（流式 SSE）：同样记账 requests+1，[DONE] 正常收尾
   [2b] 首字/速度/缓存：ttft_ms、gen_ms、tokens_per_sec、cache_hit_pct 落盘
+  [2c] 思考档位：requested/actual 落盘，SOLO 下发 reasoning_effort_level
   [3] 相同提示连发两次：两条 usage 行、两个不同 request_id（不误去重）
   [4] 上游失败：record_error 一次（502），不产生 usage 行，errors+1
   [5] 禁用账号不可回退：池里只有 disabled 账号 -> 503，且不调用上游
@@ -186,7 +187,9 @@ def main():
                             "request_id": kw.get("request_id"),
                             "stream": kw.get("stream"),
                             "ttft_ms": kw.get("ttft_ms"),
-                            "gen_ms": kw.get("gen_ms")})
+                            "gen_ms": kw.get("gen_ms"),
+                            "effort": kw.get("effort"),
+                            "effort_requested": kw.get("effort_requested")})
         return saved_record_usage(model, usage, **kw)
 
     def spy_error(model, status, message, **kw):
@@ -300,6 +303,41 @@ def main():
             P.trae_solo_chat = fake_solo
 
         # ---------------------------------------------------------------
+        section("[2c] 思考档位：请求档位落盘 + 下发字段")
+        seen = {}
+
+        def fake_solo_effort(account, payload):
+            seen["effort"] = payload.get("_solo_effort")
+            seen["field"] = payload.get("_solo_effort_field")
+            return {"content": "ok", "reasoning": "", "tool_calls": [],
+                    "finish_reason": "stop",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                              "total_tokens": 12}}
+
+        P.trae_solo_chat = fake_solo_effort
+        try:
+            before = len(usage_calls)
+            code, _body = http.post("/v1/agent/chat", dict(
+                base_payload, stream=True, reasoning_effort="low"))
+            check("带档位请求 -> 200", code == 200, code)
+            call = usage_calls[-1] if len(usage_calls) > before else {}
+            check("record_usage 带 requested=low",
+                  call.get("effort_requested") == "low", call)
+            check("record_usage 带实际档位 light",
+                  call.get("effort") == "light", call)
+            check("下发字段 reasoning_effort_level",
+                  seen.get("field") == "reasoning_effort_level", seen)
+            check("下发档位 light", seen.get("effort") == "light", seen)
+            row = [r for r in read_rows(P.USAGE_LOG)
+                   if r.get("model") == MODEL][-1]
+            check("行内 requested=low",
+                  row.get("reasoning_effort_requested") == "low", row)
+            check("行内实际档位=light",
+                  row.get("reasoning_effort") == "light", row)
+        finally:
+            P.trae_solo_chat = fake_solo
+
+        # ---------------------------------------------------------------
         section("[3] 相同提示连发两次：不误去重")
         req2 = P._usage["requests"]
         before = len(usage_calls)
@@ -314,7 +352,7 @@ def main():
         check("两次 request_id 不同（uuid 每请求唯一）",
               len(rids) == 2 and rids[0] != rids[1], rids)
         rows = [r for r in read_rows(P.USAGE_LOG) if r.get("model") == MODEL]
-        check("usage 行累计 5（未被提示指纹去重）", len(rows) == 5, len(rows))
+        check("usage 行累计 6（未被提示指纹去重）", len(rows) == 6, len(rows))
 
         # ---------------------------------------------------------------
         section("[4] 上游失败：record_error、不记 usage")

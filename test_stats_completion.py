@@ -206,10 +206,20 @@ check("4 credits_summary 带 composition", len(row.get("composition") or []) == 
 check("4 credits_summary 带 size", row.get("credits_size") == 600,
       row.get("credits_size"))
 
+# 面板「更新于」：public() 必须给出可直接展示的 ISO 串，而不是让前端猜字段。
+acct.usage_updated_at = int(fixed)
+_public = acct.public()
+check("4 creditsUpdatedIso 是 19 位 ISO 串",
+      isinstance(_public.get("creditsUpdatedIso"), str)
+      and len(_public["creditsUpdatedIso"]) == 19,
+      _public.get("creditsUpdatedIso"))
+
 # ---------------------------------------------------------------------------
 # 5) /usage/remaining：24h 消耗外推
 # ---------------------------------------------------------------------------
-remaining = P.usage_remaining(ttl=0)
+# 时间窗口必须跟着夹具的 fixed 走，否则测试跑过 24h 后会自然过期。
+with mock.patch.object(P.time, "time", return_value=fixed):
+    remaining = P.usage_remaining(ttl=0)
 r = (remaining.get("rows") or [{}])[0]
 check("5 remaining 有 rows", bool(remaining.get("rows")), remaining)
 check("5 24h 积分消耗 = 6.0", r.get("used_24h_credit") == 6.0, r)

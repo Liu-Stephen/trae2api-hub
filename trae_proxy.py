@@ -779,6 +779,59 @@ def _usage_present(usage):
                ("prompt_tokens", "completion_tokens", "total_tokens"))
 
 
+# 上游 usage 原始字段观测（排障用，每进程每种形状一行）。
+#
+# 账本里的 credit 是**白名单投影**的结果（见下面 fields 只挑固定几个键）：未知
+# 字段在写盘前就被丢弃，所以「账本里 credit 恒为 0」既可能是上游没发，也可能是
+# 上游换了个字段名而这里没认出来 —— 这两件事只能靠原始键集合区分。
+#
+# 按「键集合」去重：同一个上游形状只记一次，换了形状才再记；只输出键名与数值，
+# 不输出任何字符串值（token_usage 里的字符串字段可能是正文）。
+_USAGE_SHAPE_SEEN = set()
+_USAGE_SHAPE_SEEN_LIMIT = 16
+_USAGE_SHAPE_LOCK = threading.Lock()
+#: 与积分/花费相关的键名特征：命中时单独列出，方便直接 grep。
+_USAGE_SHAPE_HINTS = ("credit", "point", "cost", "charge", "bill", "price",
+                      "quota", "fee", "amount")
+
+
+def _usage_numeric_paths(usage, prefix="", depth=2, out=None):
+    """把 usage 里的数值字段摊平成 {"点路径": 数值}（最多两层，数组不展开）。
+
+    积分字段不一定在顶层：`{"details": {"credit": 1}}` 这种嵌套形状同样要让
+    观测看得见，所以摊一层进去。字符串一律不输出 —— token_usage 的字符串字段
+    可能是正文。
+    """
+    out = {} if out is None else out
+    for key, value in usage.items():
+        path = "%s.%s" % (prefix, key) if prefix else str(key)
+        if isinstance(value, dict) and depth > 0:
+            _usage_numeric_paths(value, path, depth - 1, out)
+        elif isinstance(value, (bool, int, float)):
+            out[path] = value
+    return out
+
+
+def _observe_usage_shape(usage):
+    """把上游 usage 的原始键集合记一次日志，用来确认积分字段的真名。"""
+    if not isinstance(usage, dict) or not usage:
+        return
+    shape = tuple(sorted(str(key) for key in usage))
+    with _USAGE_SHAPE_LOCK:
+        if shape in _USAGE_SHAPE_SEEN \
+                or len(_USAGE_SHAPE_SEEN) >= _USAGE_SHAPE_SEEN_LIMIT:
+            return
+        _USAGE_SHAPE_SEEN.add(shape)
+    numeric = _usage_numeric_paths(usage)
+    hints = [path for path in sorted(numeric)
+             if any(hint in path.lower() for hint in _USAGE_SHAPE_HINTS)]
+    log("upstream usage shape: keys=%s numeric=%s credit-like=%s"
+        % (",".join(shape),
+           json.dumps(numeric, ensure_ascii=False, sort_keys=True),
+           ",".join(hints) or "-"),
+        level="INFO", tag="usage")
+
+
 def usage_fields(usage):
     """归一上游 usage -> (fields, meta)。
 
@@ -790,6 +843,9 @@ def usage_fields(usage):
                       既不算命中也不能算未命中（避免把「不知道」伪造成 0%）
       usage_source    upstream | missing（行内标注，仅用于对账/排障）
     """
+    # 放在 _usage_present 之前：只有积分键、没有 token 键的 payload 会被判成
+    # usage_missing 而整份丢弃，那正是最需要看见形状的情况。
+    _observe_usage_shape(usage)
     if not _usage_present(usage):
         return {}, {"usage_missing": True, "cached_reported": False,
                     "usage_source": "missing"}

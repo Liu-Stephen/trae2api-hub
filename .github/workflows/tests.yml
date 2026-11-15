@@ -30,6 +30,7 @@ jobs:
           python test_checkin_activity.py
           python test_issue_http.py
           python test_issue_solo.py
+          python test_issue_dispatch.py
           python test_issue_packaging.py
           python -m unittest test_oauth_core test_oauth_http
       - uses: actions/setup-node@v4

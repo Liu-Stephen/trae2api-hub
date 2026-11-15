@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 
+import trae_restriction
 import trae_tasks
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -630,11 +631,28 @@ class Scheduler(object):
                                              time.localtime(started))
         self.last_cycle_kind = cycle_kind
         self.log("开始执行维护巡检 (%s)..." % trigger_reason)
-        accounts = [a for a in (getattr(self.pool, "accounts", []) or [])
-                    if getattr(a, "enabled", True)
-                    and trae_tasks._access_token(a)]
+        accounts = []
+        held = {}
+        for account in (getattr(self.pool, "accounts", []) or []):
+            if not getattr(account, "enabled", True) \
+                    or not trae_tasks._access_token(account):
+                continue
+            # 区域连坐暂停期间整区不碰上游：签到/保活这些无人值守的动作再去
+            # 「试探」一次，只会让同一设备/出口上的其它账号跟着被封。
+            realm = getattr(account, "realm", "") or ""
+            remaining = trae_restriction.hold_remaining(realm)
+            if remaining > 0:
+                held[realm or "?"] = int(remaining)
+                continue
+            accounts.append(account)
+        if held:
+            self.log("跳过区域连坐暂停中的账号（%s），本轮不换号、不打上游"
+                     % "、".join("%s 剩 %ds" % (realm, secs)
+                                 for realm, secs in sorted(held.items())))
         if not accounts:
-            self.log("暂无可用的活跃账号，跳过本次巡检")
+            # 全被区域暂停挡住时不再补一句「没有活跃账号」—— 那会把原因说错。
+            if not held:
+                self.log("暂无可用的活跃账号，跳过本次巡检")
             self._save_state()
             return
         result = trae_tasks.run_all_tasks(
@@ -714,6 +732,9 @@ class Scheduler(object):
             "last_cycle_stats": self.last_cycle_stats or {},
             "state_file": self._state_path(),
             "accounts_count": len(accounts),
+            # 区域连坐暂停（见 trae_restriction）：给轮询 /scheduler 的调用方一个
+            # 「为什么这轮没动」的机器可读原因（面板那张卡片读的是 /settings）。
+            "restrictions": trae_restriction.snapshot(),
             "running": self._run_lock.locked(),
             "tasks": tasks,
             "history": list(reversed(self.history[-10:])),

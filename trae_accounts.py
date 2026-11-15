@@ -1923,29 +1923,71 @@ class Account(object):
 # 会话粘性
 # ---------------------------------------------------------------------------
 class SessionAffinity(object):
-    """session_key -> uid 的短期绑定（同一对话固定落到同一账号）。"""
+    """session_key -> 最近用过的账号队列（front = 当前绑定）。
 
-    def __init__(self, ttl=7200, max_entries=5000):
+    从一个 key 只记一个 uid，升级成「记一队暖号」（默认 3 个，front 优先）。
+    为什么：某个号不可用时，旧实现直接把整条绑定丢掉（unbind），于是下一轮
+    从整池里重选一个**冷号**——而刚被换下来的那个号往往还握着这段会话的前缀
+    缓存，等它冷却结束回来，比重选一个冷号便宜得多（一次大 prompt 的冷启动
+    远贵于一次换号）。
+
+    现在的语义（与 workbuddy2api-hub 的 SessionAffinity 对齐）：
+      · get()     队首 uid（老调用方的语义不变，仍然返回一个 uid）；
+      · recent()  整队暖号，front 优先，供选号时逐个试；
+      · bind()    把 uid 提升到队首（已有的重复项先摘掉，再截到 history）；
+      · demote()  把 uid（默认队首）降到队尾，而不是整条丢弃；
+      · unbind()  仍然整条删除（会话真的结束 / 需要彻底重选时用）。
+    """
+
+    def __init__(self, ttl=7200, max_entries=5000, history=3):
         self.ttl = ttl
         self.max_entries = max_entries
+        try:
+            self.history = max(1, int(history))
+        except (TypeError, ValueError):
+            self.history = 1
+        # key -> (uids, exp)：uids 是 front 优先的列表
         self.bindings = {}
         self._lock = threading.Lock()
 
+    def _live(self, key):
+        """取出未过期的 uid 列表（顺带清掉过期项）。调用方需持有 _lock。"""
+        entry = self.bindings.get(key)
+        if not entry:
+            return None
+        uids, exp = entry
+        if time.time() > exp:
+            self.bindings.pop(key, None)
+            return None
+        return list(uids)
+
+    def _store(self, key, uids):
+        self.bindings[key] = (list(uids)[:self.history], time.time() + self.ttl)
+
     def get(self, key):
+        """队首 uid；无绑定 / 已过期返回 None。"""
         if not key:
             return None
         with self._lock:
-            entry = self.bindings.get(key)
-            if not entry:
+            uids = self._live(key)
+            if not uids:
                 return None
-            uid, exp = entry
-            if time.time() > exp:
-                self.bindings.pop(key, None)
-                return None
-            self.bindings[key] = (uid, time.time() + self.ttl)
-            return uid
+            self._store(key, uids)
+            return uids[0]
+
+    def recent(self, key):
+        """整队暖号（front 优先）；无绑定返回 []。"""
+        if not key:
+            return []
+        with self._lock:
+            uids = self._live(key)
+            if not uids:
+                return []
+            self._store(key, uids)
+            return uids
 
     def bind(self, key, uid):
+        """把 uid 提到队首（重复项去重），队尾截到 history 个。"""
         if not key or not uid:
             return
         with self._lock:
@@ -1953,7 +1995,31 @@ class SessionAffinity(object):
                 now = time.time()
                 self.bindings = {k: v for k, v in self.bindings.items()
                                  if v[1] > now}
-            self.bindings[key] = (uid, time.time() + self.ttl)
+            uids = [u for u in (self._live(key) or []) if u != uid]
+            uids.insert(0, uid)
+            self._store(key, uids)
+
+    def demote(self, key, uid=None):
+        """把 uid（默认队首）降到队尾，返回降级后的队首（没有绑定返回 None）。
+
+        降级而不是解绑：被换下来的号留在队里，等它冷却结束、或者这段会话下一
+        次回到它手上时，前缀缓存还是热的。
+        """
+        if not key:
+            return None
+        with self._lock:
+            uids = self._live(key)
+            if not uids:
+                return None
+            target = uids[0] if uid is None else uid
+            if target not in uids:
+                # 指定了一个不在队里的号（页轮转不绑粘性，出错的就是这种）：
+                # 什么都不动。降级队首等于把无辜的暖号挤下去。
+                return uids[0]
+            rest = [u for u in uids if u != target]
+            rest.append(target)
+            self._store(key, rest)
+            return rest[0]
 
     def unbind(self, key):
         if not key:
@@ -1994,6 +2060,9 @@ class AccountPool(object):
         self._oauth_manager = None
         self.affinity = SessionAffinity()
         self._weights = {}
+        # 超长会话的「页」轮转（见 pick(page=...)）：页内轮转与主轮转各用一份
+        # 状态，互不推进对方的游标；页内排名按 uid 排序，重启后仍是同一页。
+        self._page_weights = {}
         # 区域出口覆盖（运行期）：{"cn": "...", "intl": "...", "global": "..."}
         self.proxies = {}
         self._settings_doc = None
@@ -2343,60 +2412,139 @@ class AccountPool(object):
         return account.public()
 
     # -- 选号 ------------------------------------------------------------
-    def _weighted_pick(self, candidates):
-        """平滑加权轮转（nginx smooth WRR）：等权时退化为严格轮转。"""
+    def _weighted_pick(self, candidates, state=None):
+        """平滑加权轮转（nginx smooth WRR）：等权时退化为严格轮转。
+
+        state 是可选的轮转状态 dict（uid -> 当前累计值）。默认用主轮转
+        `_weights`；页轮转（pick(page=...)）传自己的一份，这样「页内轮转」
+        与「整池轮转」不会互相推进对方的游标（wb 的同款处理）。
+        """
         if not candidates:
             return None
+        if state is None:
+            state = self._weights
         weights = [max(0.0001, float(a.weight or 1.0)) for a in candidates]
         total = sum(weights) or 1.0
         with self._lock:
             best_i, best_cur = 0, None
             for i, account in enumerate(candidates):
-                cur = self._weights.get(account.uid, 0.0) + weights[i]
+                cur = state.get(account.uid, 0.0) + weights[i]
                 if best_cur is None or cur > best_cur:
                     best_i, best_cur = i, cur
             winner = candidates[best_i]
-            self._weights[winner.uid] = best_cur - total
-            if len(self._weights) > 256:
+            state[winner.uid] = best_cur - total
+            if len(state) > 256:
                 keep = {a.uid for a in candidates}
-                for uid in [u for u in self._weights if u not in keep]:
-                    self._weights.pop(uid, None)
+                for uid in [u for u in state if u not in keep]:
+                    state.pop(uid, None)
         return winner
 
+    def _page_ranks(self, snapshot):
+        """uid -> 在该区域快照里的排名（按 uid 排序）。
+
+        排名按 uid 而不是文件顺序 / 载入顺序：重启、重载之后页的成员不变，
+        增删账号时每页最多挪一格（wb 的同款口径）。
+
+        不缓存：缓存只能存一份，双区交替选号时每次都失效（等于没有缓存），
+        而排序的规模是账号数（几十），远小于一次上游往返。
+        """
+        uids = sorted(a.uid for a in snapshot if a.uid)
+        return {uid: rank for rank, uid in enumerate(uids)}
+
+    def _page_slice(self, snapshot, page):
+        """一页账号：rank(uid) % size == index % size。
+
+        size <= 1 或 size 覆盖整池时返回整个快照（「整池一页」不叫分页，
+        等价于不分页）。分页只决定**候选集合**，可用性仍由 ready() 决定。
+        """
+        try:
+            index, size = int(page[0]), int(page[1])
+        except (TypeError, ValueError, IndexError):
+            return snapshot
+        ranks = self._page_ranks(snapshot)
+        if size <= 1 or size >= len(ranks):
+            return snapshot
+        out = []
+        for account in snapshot:
+            rank = ranks.get(account.uid)
+            if rank is not None and rank % size == index % size:
+                out.append(account)
+        return out
+
+    def _page_state(self, page):
+        """页轮转状态（每页一份）。页数有上限，超出就丢掉最老的一份。"""
+        try:
+            key = (int(page[0]), int(page[1]))
+        except (TypeError, ValueError, IndexError):
+            key = ("?", "?")
+        with self._lock:
+            state = self._page_weights.get(key)
+            if state is None:
+                if len(self._page_weights) >= 64:
+                    self._page_weights.pop(next(iter(self._page_weights)), None)
+                state = self._page_weights[key] = {}
+            return state
+
     def pick(self, realm=None, exclude=None, model=None, session_key=None,
-             now=None, ignore_inflight=False):
+             now=None, ignore_inflight=False, page=None):
         """选一个可用账号。
 
-        优先级：会话粘性 > 未饱和（并发上限）> 加权轮转。
+        优先级：会话暖号（front 优先，依次试）> 未饱和（并发上限）> 加权轮转。
         全部饱和时返回 None（并发上限是硬闸门：调用方据此返回 429/503，
         或在已知会立刻占用 slot 的场景传 ignore_inflight=True 自行把关）。
+
+        page=(index, size) 是「超长会话」的页轮转（见 wb 的 page 机制）：
+        此时**不看粘性、也不绑粘性**，只在页内做加权轮转 —— 一份几十万 token
+        的 body 不该永远压在某一个号上（它一旦被限流，这段会话就没有暖号可回），
+        而页内每个号都会持有这份会话的一个前缀副本，缓存仍然有得命中。
         """
         now = now or _now()
         exclude = set(exclude or ())
-        if session_key:
-            bound = self.affinity.get(session_key)
-            if bound and bound not in exclude:
-                account = self.get(bound)
-                if account and account.ready(model=model, now=now) \
-                        and (not realm or account.realm == realm):
-                    if ignore_inflight or not self._saturated(account):
-                        return self._apply_egress(account)
-                    # 粘性账号已饱和：解绑，交给正常路由（避免死锁在同一号）
-                    self.affinity.unbind(session_key)
+        snapshot = self.by_realm(realm)
+        if page is not None:
+            snapshot = self._page_slice(snapshot, page)
+        elif session_key:
+            # 会话暖号：front 优先，不可用（冷却 / 饱和 / 已下线）就往后试。
+            # 一个都用不上时**不**解绑 —— 交给下面的正常选号，选中的号会被
+            # bind() 提到队首，原来那些暖号留在队里等下一次。
+            for uid in self.affinity.recent(session_key):
+                if uid in exclude:
+                    continue
+                account = self.get(uid)
+                if account is None or (realm and account.realm != realm):
+                    continue
+                if not account.ready(model=model, now=now):
+                    continue
+                if not ignore_inflight and self._saturated(account):
+                    continue
+                self.affinity.bind(session_key, uid)
+                return self._apply_egress(account)
 
-        pool = [a for a in self.by_realm(realm)
+        pool = [a for a in snapshot
                 if a.uid not in exclude and a.ready(model=model, now=now)]
         if not pool:
             return None
         if not ignore_inflight:
             pool = [a for a in pool if not self._saturated(a)]
-        chosen = self._weighted_pick(pool)
-        if chosen is not None and session_key:
+        chosen = self._weighted_pick(
+            pool, state=self._page_state(page) if page is not None else None)
+        if chosen is not None and session_key and page is None:
             self.affinity.bind(session_key, chosen.uid)
         return self._apply_egress(chosen)
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None,
-                         model=None):
+                         model=None, page=None):
+        """一轮对话的选号。
+
+        page 不为空时：页内轮转（不绑粘性）；页内此刻没人可用就退回整池选号
+        —— 服务成功优先于轮转纪律（与 wb 的「page 无人可用就别不服务」一致）。
+        """
+        if page is not None:
+            account = self.pick(realm=realm, exclude=exclude, model=model,
+                                page=page)
+            if account is not None:
+                return account
+            return self.pick(realm=realm, exclude=exclude, model=model)
         return self.pick(realm=realm, exclude=exclude, model=model,
                          session_key=session_key)
 

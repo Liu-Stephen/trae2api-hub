@@ -253,6 +253,98 @@ check('关键模态框 id 唯一', () => {
   });
 });
 
+/* ---- 区域连坐暂停（设置页卡片）---- */
+function loadRestrictionUi() {
+  const src = extract('/* BEGIN-RESTRICTION-UI', '/* END-RESTRICTION-UI */');
+  return new Function(
+    'function esc(s){ return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")'
+    + '.replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }\n' + src +
+    '\nreturn { restrictionRealmLabel, restrictionClock, restrictionHoldsHtml };'
+  )();
+}
+
+check('抽取连坐暂停 UI 纯函数', () => {
+  const ui = loadRestrictionUi();
+  assert.strictEqual(typeof ui.restrictionClock, 'function');
+  assert.strictEqual(typeof ui.restrictionHoldsHtml, 'function');
+});
+
+check('倒计时格式化：分:秒，负数归零', () => {
+  const ui = loadRestrictionUi();
+  assert.strictEqual(ui.restrictionClock(1500), '25:00');
+  assert.strictEqual(ui.restrictionClock(59), '0:59');
+  assert.strictEqual(ui.restrictionClock(0), '0:00');
+  assert.strictEqual(ui.restrictionClock(-5), '0:00');
+});
+
+check('区域名称映射：cn/intl/未知', () => {
+  const ui = loadRestrictionUi();
+  assert.strictEqual(ui.restrictionRealmLabel('cn'), '国内版');
+  assert.strictEqual(ui.restrictionRealmLabel('intl'), '国际版');
+  assert.strictEqual(ui.restrictionRealmLabel(''), '?');
+  assert.strictEqual(ui.restrictionRealmLabel('other'), 'other');
+});
+
+check('无暂停时显示「没有区域被暂停」', () => {
+  const ui = loadRestrictionUi();
+  const out = ui.restrictionHoldsHtml({ hold_until: {}, events: {}, wave_min: 3 }, 1000);
+  assert.ok(out.includes('没有区域被暂停'), out);
+  assert.ok(!out.includes('已暂停'), out);
+});
+
+check('有暂停时显示剩余时间与自动恢复时刻', () => {
+  const ui = loadRestrictionUi();
+  const now = 1700000000;
+  const out = ui.restrictionHoldsHtml(
+    { hold_until: { cn: now + 125 }, events: {}, wave_min: 3, hold_seconds: 1800 }, now);
+  assert.ok(out.includes('已暂停'), out);
+  assert.ok(out.includes('国内版'), out);
+  assert.ok(out.includes('2:05'), out);
+  assert.ok(out.includes('data-restriction-left="cn"'), out);
+  assert.ok(out.includes('自动恢复'), out);
+});
+
+check('已过期的暂停不再显示为暂停', () => {
+  const ui = loadRestrictionUi();
+  const now = 1700000000;
+  const out = ui.restrictionHoldsHtml({ hold_until: { cn: now - 1 }, events: {} }, now);
+  assert.ok(out.includes('没有区域被暂停'), out);
+});
+
+check('波次进度按「n/阈值 个账号」显示', () => {
+  const ui = loadRestrictionUi();
+  const out = ui.restrictionHoldsHtml(
+    { hold_until: {}, events: { cn: ['a', 'b'] }, wave_min: 3 }, 1700000000);
+  assert.ok(out.includes('国内版 2/3 个账号'), out);
+  assert.ok(out.includes('达到 3 个即暂停该区域'), out);
+});
+
+check('设置页有连坐暂停卡片且与后端接口对齐', () => {
+  assert.ok(html.includes('id="sectionRestriction"'), 'missing section');
+  ['restrictionHoldSeconds', 'restrictionWaveMin', 'restrictionWaveWindow',
+   'restrictionHolds'].forEach(id => {
+    assert.ok(html.includes('id="' + id + '"'), 'missing input: ' + id);
+  });
+  assert.ok(html.includes('renderRestriction(data.restriction || null)'),
+    'loadSettings must render the snapshot');
+  assert.ok(html.includes("'/settings/save', {restriction: payload}"),
+    'save must post the restriction block');
+  assert.ok(html.includes("'/settings/save', {restriction_clear: true}"),
+    'clear must post restriction_clear');
+});
+
+check('连坐暂停状态行的两种文案都有英文精确键', () => {
+  // 翻译是精确匹配（trim/空白折叠之外不做标点归一）：全角（）与半角 ()
+  // 是两个不同的键，写错一个字母就整行不翻译。
+  const en = JSON.parse(fs.readFileSync(path.join(__dirname, 'i18n', 'en.json'), 'utf8'));
+  const row = html.match(/state\.textContent = paused \? '([^']+)' : '([^']+)'/);
+  assert.ok(row, 'missing restriction state row');
+  [row[1], row[2]].forEach(text => {
+    assert.ok(Object.prototype.hasOwnProperty.call(en.messages, text),
+      'no exact en.json key for: ' + text);
+  });
+});
+
 console.log('');
 console.log('dashboard issue regression');
 console.log('  file      : ' + htmlPath);

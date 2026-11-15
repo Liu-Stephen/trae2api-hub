@@ -12,6 +12,7 @@ import fnmatch
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -709,6 +710,69 @@ def set_limit(accounts_dir, key, scope, value):
         data[LIMITS_KEY] = limits
         save(accounts_dir, data)
     return entry
+
+# --------------------------------------------------------- 区域连坐暂停
+# 区域级「一批账号接连被限制」的判定阈值与暂停时长（见 trae_restriction）。
+#
+# 存三项：hold_seconds（暂停多久）/ wave_min（多少个不同账号算一批）/
+# wave_window（多长时间内的限制算同一批）。缺省值放在 trae_restriction 里，
+# 这里只负责「读得到、写得进」，读路径永不抛：设置文件坏了就回落到默认值，
+# 不能因为一个坏 JSON 把防连坐的闸门整个关掉。
+
+RESTRICTION_KEY = "restriction"
+RESTRICTION_FIELDS = ("hold_seconds", "wave_min", "wave_window")
+
+
+def restriction_settings(accounts_dir):
+    """settings.json 的 restriction 段（原样返回 dict，缺省给空 dict）。
+
+    数值校验在 trae_restriction.limits() 里做（那里还要合并环境变量），
+    这里不做二次解释，避免两处口径分叉。
+    """
+    with _lock:
+        raw = load(accounts_dir).get(RESTRICTION_KEY)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def set_restriction_settings(accounts_dir, values):
+    """落盘 restriction 段；只接受已知字段，非法值一律丢弃（返回落盘后的 dict）。
+
+    **整段替换语义**：没给的字段回到内置默认（面板总是发全三个；只发一个
+    `hold_seconds` 会让 `wave_min` / `wave_window` 回到默认值）。
+    传 None / 空 dict 表示清除整段（同样回到内置默认）。
+    """
+    clean = {}
+    if isinstance(values, dict):
+        for key in RESTRICTION_FIELDS:
+            if key not in values:
+                continue
+            value = values.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(number):
+                # nan/inf 会在 int(wave_min) 处抛 ValueError，一路冒到面板变成
+                # 500；而且 json 会把它们写成非标准的 NaN/Infinity。
+                continue
+            clean[key] = int(number) if key == "wave_min" else number
+    with _lock:
+        # 与 set_model_context / panel_session_secret 同一条纪律：settings.json
+        # 存在但读不出来时**拒绝回写**。load() 把「文件不存在」和「解析失败」
+        # 都吐成 {}，拿它去 save 会把 panel_password_hash / api_keys / limits
+        # 整份抹掉（面板退回默认口令 admin、所有 Key 失效）。
+        if not _settings_is_rewritable(accounts_dir):
+            raise OSError(
+                "settings.json 存在但解析不了，拒绝覆盖（那会丢面板密码与 API Key）")
+        data = load(accounts_dir)
+        if clean:
+            data[RESTRICTION_KEY] = clean
+        else:
+            data.pop(RESTRICTION_KEY, None)
+        save(accounts_dir, data)
+    return clean
 
 # --------------------------------------------------------- model context
 # issue #106：模型上下文窗口覆盖（面板下拉 -> settings.json -> 网关热路径）。

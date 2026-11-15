@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 18
+    "version": 19
   },
   "messages": {
     "剩余 / 总额度": "Remaining / total credits",
@@ -849,7 +849,18 @@
     "lenient 是折中：那一轮没有工具调用，但对话不会断。上游修好后建议切回 strict。": "Lenient mode is a compromise: that turn has no tool calls, but the conversation continues. Return to strict mode after upstream is fixed.",
     "高": "High",
     "低": "Low",
-    "不指定 Key（管理员预览）": "No key (administrator preview)"
+    "不指定 Key（管理员预览）": "No key (administrator preview)",
+    "区域连坐暂停": "Regional cascade pause",
+    "（有区域暂停中）": "(a region is paused)",
+    "（运行中）": "(running)",
+    "保存阈值": "Save thresholds",
+    "立即解除暂停": "Release the pause",
+    "正在读取…": "Loading…",
+    "暂停时长（秒，0 = 关闭该机制）": "Pause length in seconds (0 = off)",
+    "触发账号数（不同 uid）": "Accounts to trigger (distinct uids)",
+    "判定窗口（秒）": "Detection window in seconds",
+    "● 已暂停": "● Paused",
+    "● 没有区域被暂停": "● No region is paused"
   },
   "patterns": {
     "个人 {0} / {1}": "Personal {0} / {1}",

@@ -15,7 +15,6 @@ from pathlib import Path
 _LOCK = threading.RLock()
 _CACHE = {}
 STRATEGIES = ("round-robin", "weighted-round-robin", "fill-first")
-_SELECTOR_STATE = {}
 DEFAULT_POLICY = {"strategy": "round-robin", "session_affinity": True,
                   "request_retry": 0, "max_retry_accounts": 0}
 
@@ -256,68 +255,6 @@ def resolve(directory, accounts, model, key=None, explicit_realm=None, config=No
 
 def _ready(account, model):
     return bool(account and account.enabled and account.access_token and account.ready(model=model))
-
-
-def candidates(pool, decision, realm, model, exclude=None):
-    allowed, excluded = decision.get("allowed_uids"), set(exclude or [])
-    ready = {a.uid: a for a in list(pool.accounts) if a.realm == realm
-             and a.uid not in excluded and (allowed is None or a.uid in allowed)
-             and _ready(a, model)}
-    tiers = decision.get("tiers") or []
-    if not tiers:
-        return list(ready.values()), None
-    for tier in tiers:
-        rows = [ready[uid] for uid in tier["accounts"] if uid in ready
-                and (decision["strategy"] != "weighted-round-robin" or tier["weights"].get(uid, 1) > 0)]
-        if rows:
-            return rows, tier
-    return [], None
-
-
-def pick(pool, decision, realm, model, session_key=None, exclude=None):
-    excluded, allowed = set(exclude or []), decision.get("allowed_uids")
-    policy = decision.get("policy") or DEFAULT_POLICY
-    affinity = bool(policy.get("session_affinity", True))
-    tiers = decision.get("tiers") or []
-    if affinity and session_key:
-        uid = pool.affinity.get(session_key)
-        bound = pool.get(uid) if uid else None
-        weight_ok = not tiers or decision["strategy"] != "weighted-round-robin" or any(
-            uid in t["accounts"] and t["weights"].get(uid, 1) > 0 for t in tiers)
-        if (bound and bound.realm == realm and uid not in excluded
-                and (allowed is None or uid in allowed) and weight_ok and _ready(bound, model)):
-            return bound
-    strategy = decision.get("strategy", "round-robin")
-    if not tiers and strategy == "round-robin":
-        options = {"allowed_uids": allowed} if allowed is not None else {}
-        return pool.pick_for_session(realm=realm, session_key=session_key if affinity else None,
-                                     exclude=excluded, model=model, **options)
-    rows, tier = candidates(pool, decision, realm, model, excluded)
-    if not rows:
-        return None
-    if strategy == "fill-first":
-        chosen = rows[0]
-    else:
-        state_key = (decision.get("scope_id", ""), realm, model, (tier or {}).get("id", "all"), strategy,
-                     tuple((a.uid, (tier or {}).get("weights", {}).get(a.uid, 1)) for a in rows))
-        with _LOCK:
-            if len(_SELECTOR_STATE) >= 512 and state_key not in _SELECTOR_STATE:
-                _SELECTOR_STATE.pop(next(iter(_SELECTOR_STATE)))
-            if strategy == "weighted-round-robin":
-                state = _SELECTOR_STATE.setdefault(state_key, {})
-                weights = {a.uid: (tier or {}).get("weights", {}).get(a.uid, 1) for a in rows}
-                total = sum(weights.values())
-                for a in rows:
-                    state[a.uid] = state.get(a.uid, 0) + weights[a.uid]
-                chosen = max(rows, key=lambda a: state[a.uid])
-                state[chosen.uid] -= total
-            else:
-                cursor = _SELECTOR_STATE.get(state_key, 0)
-                chosen = rows[cursor % len(rows)]
-                _SELECTOR_STATE[state_key] = cursor+1
-    if affinity and session_key:
-        pool.affinity.bind(session_key, chosen.uid)
-    return chosen
 
 
 def preview(directory, accounts, model, key=None, realm=None, config=None, fallback_realm=None):

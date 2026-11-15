@@ -4225,6 +4225,44 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       </div>
     </section>
 
+    <section id="sectionRestriction">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">区域连坐暂停 <em id="setRestrictionState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
+            同一区域里<b>不同账号</b>在判定窗口内接连被上游限制（403 / 风控）达到阈值时，
+            网关判定为区域级扫荡并<b>暂停整个区域的派发</b>：期间不选号、不换号、不打上游
+            （签到 / 保活同样跳过），请求直接回 <code>429 + Retry-After</code>，到期自动恢复。
+            <br>换号正是放大器 —— 同一设备 / 同一出口上的账号会被上游<b>按批</b>处理，
+            继续换号试探只会把剩下的号一个个送进去。
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button onclick="saveRestriction(this)">保存阈值</button>
+          <button class="sec" onclick="clearRestriction(this)">立即解除暂停</button>
+        </div>
+      </div>
+      <div id="restrictionHolds" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.9">
+        正在读取…
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:12px">
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">暂停时长（秒，0 = 关闭该机制）</div>
+          <input id="restrictionHoldSeconds" type="number" min="0" step="60" value="1800" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">触发账号数（不同 uid）</div>
+          <input id="restrictionWaveMin" type="number" min="1" step="1" value="3" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">判定窗口（秒）</div>
+          <input id="restrictionWaveWindow" type="number" min="1" step="60" value="600" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--dim);margin-top:10px;line-height:1.7">
+        凭证过期、<code>4008</code> 额度用尽、上游排队（<code>10605</code>）、内容审核、
+        同一个账号反复失败都不计入波次。环境变量 <code>TRAE_RESTRICTION_*</code> 优先于这里的值；
+        暂停状态落在 <code>usage/restriction.json</code>，重启不会清零。
+      </div>
+    </section>
+
     <section>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
@@ -9059,6 +9097,143 @@ async function saveAutoDegrade(btn){
   finally{ if(btn) btn.disabled = false; }
 }
 
+/* ---- 区域连坐暂停（见 trae_restriction / README「区域连坐暂停」）----
+ * 面板只做三件事：显示「现在有没有区域被停、还剩多久」、改三个阈值、立即解除。
+ * 倒计时用后端给的 hold_until（epoch）在本地每秒算，不轮询接口；归零后自动重读一次。 */
+var RESTRICTION_SNAPSHOT = null;
+var RESTRICTION_TIMER = null;
+
+/* BEGIN-RESTRICTION-UI —— 纯函数（可被 test_issue_dashboard.js 抽出在 node 里直接跑） */
+function restrictionRealmLabel(realm){
+  if(realm === 'cn') return '国内版';
+  if(realm === 'intl') return '国际版';
+  return realm || '?';
+}
+
+function restrictionClock(seconds){
+  var total = Math.max(0, Math.round(seconds));
+  var m = Math.floor(total / 60);
+  var s = total % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+/* 暂停面板的正文：哪些区域在暂停、还剩多久、以及「离触发还差几个账号」。
+ * 只拼字符串，不碰 DOM —— 这样倒计时每秒重算也好、node 里断言也好都是同一份。 */
+function restrictionHoldsHtml(snap, nowSeconds){
+  snap = snap || {};
+  var until = snap.hold_until || {};
+  var waveMin = snap.wave_min || 3;
+  var now = nowSeconds == null ? (Date.now() / 1000) : nowSeconds;
+  var lines = [];
+  Object.keys(until).forEach(function(realm){
+    var left = until[realm] - now;
+    if(left <= 0) return;
+    var at = new Date(until[realm] * 1000);
+    var clock = ('0' + at.getHours()).slice(-2) + ':' + ('0' + at.getMinutes()).slice(-2)
+      + ':' + ('0' + at.getSeconds()).slice(-2);
+    lines.push('<span style="color:var(--warn)">● 已暂停</span> <b>' + esc(restrictionRealmLabel(realm))
+      + '</b> 还剩 <b data-restriction-left="' + esc(realm) + '">' + restrictionClock(left) + '</b>'
+      + '<span style="color:var(--dim)">（' + esc(clock) + ' 自动恢复）</span>');
+  });
+  var events = snap.events || {};
+  var waves = Object.keys(events).map(function(realm){
+    return esc(restrictionRealmLabel(realm)) + ' ' + (events[realm] || []).length + '/' + waveMin + ' 个账号';
+  });
+  var html = lines.length
+    ? lines.join('<br>')
+    : '<span style="color:var(--accent2)">● 没有区域被暂停</span>';
+  if(waves.length){
+    html += '<div style="color:var(--dim);margin-top:6px">判定窗口内被限制的账号：'
+      + waves.join('；') + '（达到 ' + waveMin + ' 个即暂停该区域）</div>';
+  }
+  return html;
+}
+/* END-RESTRICTION-UI */
+
+function renderRestriction(snap){
+  RESTRICTION_SNAPSHOT = snap || null;
+  var cfg = snap || {};
+  var set = function(id, value){ var el = document.getElementById(id); if(el) el.value = value; };
+  set('restrictionHoldSeconds', cfg.hold_seconds == null ? 1800 : Math.round(cfg.hold_seconds));
+  set('restrictionWaveMin', cfg.wave_min == null ? 3 : cfg.wave_min);
+  set('restrictionWaveWindow', cfg.wave_window == null ? 600 : Math.round(cfg.wave_window));
+  var state = document.getElementById('setRestrictionState');
+  if(state){
+    var paused = Object.keys(cfg.hold_until || {}).length > 0;
+    state.textContent = paused ? '（有区域暂停中）' : '（运行中）';
+    state.style.color = paused ? 'var(--warn)' : 'var(--accent2)';
+  }
+  renderRestrictionHolds();
+}
+
+function renderRestrictionHolds(){
+  var box = document.getElementById('restrictionHolds');
+  if(!box) return;
+  box.innerHTML = restrictionHoldsHtml(RESTRICTION_SNAPSHOT, Date.now() / 1000);
+  startRestrictionTicker();
+}
+
+function startRestrictionTicker(){
+  if(RESTRICTION_TIMER) return;
+  var until = (RESTRICTION_SNAPSHOT || {}).hold_until || {};
+  if(!Object.keys(until).length) return;
+  RESTRICTION_TIMER = setInterval(function(){
+    var box = document.getElementById('restrictionHolds');
+    var holds = (RESTRICTION_SNAPSHOT || {}).hold_until || {};
+    var now = Date.now() / 1000;
+    var expired = false;
+    Object.keys(holds).forEach(function(realm){
+      var left = holds[realm] - now;
+      if(left <= 0){ expired = true; return; }
+      var el = box && box.querySelector('[data-restriction-left="' + realm + '"]');
+      if(el) el.textContent = restrictionClock(left);
+    });
+    // 面板开着的时候暂停到期了：停表并重读一次，让「已暂停」自己消失。
+    if(expired || !box){
+      stopRestrictionTicker();
+      loadSettings();
+    }
+  }, 1000);
+}
+
+function stopRestrictionTicker(){
+  if(RESTRICTION_TIMER){ clearInterval(RESTRICTION_TIMER); RESTRICTION_TIMER = null; }
+}
+
+async function saveRestriction(btn){
+  if(btn) btn.disabled = true;
+  try{
+    var num = function(id, fallback){
+      var el = document.getElementById(id);
+      var value = parseInt((el && el.value) || '', 10);
+      return isNaN(value) ? fallback : value;
+    };
+    var payload = {
+      hold_seconds: Math.max(0, num('restrictionHoldSeconds', 1800)),
+      wave_min: Math.max(1, num('restrictionWaveMin', 3)),
+      wave_window: Math.max(1, num('restrictionWaveWindow', 600)),
+    };
+    var r = await postJSON('/settings/save', {restriction: payload});
+    if(r && r.restriction) renderRestriction(r.restriction); else loadSettings();
+    toast('连坐暂停阈值已保存（暂停 ' + payload.hold_seconds + ' 秒 / 触发 '
+      + payload.wave_min + ' 个账号 / 窗口 ' + payload.wave_window + ' 秒）', 'ok');
+  }catch(e){ toast('保存失败: ' + (e && e.message ? e.message : e), 'bad'); }
+  finally{ if(btn) btn.disabled = false; }
+}
+
+async function clearRestriction(btn){
+  if(btn) btn.disabled = true;
+  try{
+    var r = await postJSON('/settings/save', {restriction_clear: true});
+    if(r && r.restriction) renderRestriction(r.restriction); else loadSettings();
+    var cleared = (r && r.restriction_cleared) || [];
+    toast(cleared.length
+      ? ('已解除暂停：' + cleared.map(restrictionRealmLabel).join('、'))
+      : '当前没有区域处于暂停', cleared.length ? 'ok' : 'warn');
+  }catch(e){ toast('解除失败: ' + (e && e.message ? e.message : e), 'bad'); }
+  finally{ if(btn) btn.disabled = false; }
+}
+
 async function exportConfig(btn){
   if(btn) btn.disabled = true;
   try{
@@ -9146,6 +9321,7 @@ async function loadSettings(showToast){
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);
     renderAutoDegrade(data.auto_degrade || {});
+    renderRestriction(data.restriction || null);
     loadDegradeModels();   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {

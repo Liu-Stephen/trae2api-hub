@@ -58,6 +58,7 @@ import trae_anthropic
 import trae_catalog
 import trae_fingerprint
 import trae_probe
+import trae_restriction
 import trae_settings
 import trae_admin
 import trae_routing
@@ -621,6 +622,14 @@ except Exception:
     pass
 try:
     trae_probe.set_health_path(os.path.join(USAGE_DIR, "model_health.json"))
+except Exception:
+    pass
+# 区域连坐暂停的状态与设置接线：暂停落盘到 usage/restriction.json（重启不清零
+# —— 重启后立刻恢复打号正是这套机制要防的事），阈值从 settings.json 读。
+try:
+    trae_restriction.configure(
+        state_dir=USAGE_DIR,
+        settings_resolver=lambda: trae_settings.restriction_settings(ACCOUNTS_DIR))
 except Exception:
     pass
 STATIC_ASSETS = {
@@ -3308,6 +3317,40 @@ def gateway_models_for_agents(realm=None):
     return {"models": out[:80]}
 
 
+def apply_restriction_payload(payload):
+    """处理 `/settings/save` 里的区域连坐段，返回 (reply, error)。
+
+    两种动作，可同时给（**先落阈值、再解除**：落盘失败时不该已经解除了一半）：
+
+      · ``{"restriction": {...}}``      保存三个阈值；`hold_seconds` 改小时同步
+        截断**现有**暂停（否则面板调成 5 分钟要等上一轮 30 分钟走完才生效）；
+      · ``{"restriction_clear": true}``  立即解除暂停（可选 ``restriction_realm``
+        只解除一个区域；不带则解除全部）。
+
+    error 非空表示这次动作没做成（入参非法 / settings.json 读不出来），由调用方
+    翻成 400；本函数不抛异常、不碰 HTTP。
+    """
+    reply = {}
+    if "restriction" in payload:
+        raw = payload.get("restriction")
+        if raw is not None and not isinstance(raw, dict):
+            return {}, "restriction must be an object"
+        try:
+            stored = trae_settings.set_restriction_settings(ACCOUNTS_DIR, raw or {})
+        except OSError as exc:
+            return {}, str(exc)
+        if stored.get("hold_seconds") is not None:
+            trae_restriction.clamp_holds(stored.get("hold_seconds"))
+    cleared = False
+    if payload.get("restriction_clear"):
+        realm = payload.get("restriction_realm") or None
+        reply["restriction_cleared"] = trae_restriction.clear(realm)
+        cleared = True
+    if "restriction" in payload or cleared:
+        reply["restriction"] = trae_restriction.snapshot()
+    return reply, ""
+
+
 def runtime_settings_view():
     """Current panel-visible settings (never returns the password or the key)."""
     key = API_KEY or ""
@@ -3345,6 +3388,8 @@ def runtime_settings_view():
         "limits": trae_settings.limits_data(ACCOUNTS_DIR),
         "auto_degrade": trae_settings.auto_degrade(ACCOUNTS_DIR),
         "model_context": trae_settings.model_context(ACCOUNTS_DIR),
+        # 区域连坐暂停：阈值 + 当前生效的暂停（面板改阈值、看「为什么被停」都读这里）
+        "restriction": trae_restriction.snapshot(),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": trae_settings.settings_path(ACCOUNTS_DIR),
@@ -6727,6 +6772,13 @@ def _solo_note_failure(account, status, detail, total):
                 account.note_error(detail, code=status)
             else:
                 account.note_error(detail, cooldown=0)
+            # 区域连坐：SOLO 通道的限制同样计入波次（与 open_upstream 同一口径）。
+            # 单号池也照记 —— 只有 1 个号被限时 wave_min 达不到，不会误停整区。
+            if _is_account_restriction(
+                    status, detail,
+                    dead=trae_accounts.session_dead(detail or "")):
+                trae_restriction.note_account_restriction(
+                    getattr(account, "realm", "") or "", account.uid)
         elif status == 429:
             account.note_error(detail, code=429, cooldown=30)
         elif status >= 500 or status == 504:
@@ -8116,6 +8168,17 @@ class RateLimited(Exception):
             "upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+class RegionHold(RateLimited):
+    """区域连坐暂停期间的拒绝：429 + Retry-After，语义是「别换号，等」。
+
+    与 RateLimited 的区别只在含义与文案（它不是上游对**这次请求**的限流，而是
+    网关自己把整个区域停下来了），单独一个类型让响应说得清楚。
+    """
+
+    def __init__(self, detail="", wait=1800):
+        super(RegionHold, self).__init__(None, detail, wait=wait)
+
+
 # 账号级错误短冷却的“等待续上”上限：单账号池在传输/瞬时故障后只有
 # 3s（多账号 15s）冷却，此时**等待**比报 429 更正确——429 只留给真正的
 # 上游频控（model_cooldowns，由上游 HTTP 429 设置）。
@@ -8203,6 +8266,200 @@ def realm_model_throttled(realm, model):
     if waits and all(w > 0 for w in waits):
         return (True, max(1, int(min(waits))))
     return (False, 0)
+
+
+# ---------------------------------------------------------------------------
+# 超长会话的「页」轮转（借 workbuddy2api-hub 的 page 机制）
+# ---------------------------------------------------------------------------
+#: 估算输入超过这个 token 数就算「超长会话」，改走页轮转。0 = 关闭该机制。
+#: 默认 100000：这是本项目里「一个 body 大到一个号被限流就会拖死整段会话」的量级
+#: （与 FULL_PRICE_PROMPT_MIN 同一口径）。估算是粗的（字符数 / 4），它只决定
+#: 「要不要轮转」，判错一次的代价只是缓存命中率略有变化，不是功能错误。
+AFFINITY_PAGE_TOKENS = int(os.environ.get("TRAE_AFFINITY_PAGE_TOKENS") or 100000)
+#: 一页里放几个号。2 = 两个号交替：每个号都持有这段会话的前缀副本（缓存仍有
+#: 得命中），又没有哪个号独自承担全部超长 body。1 = 关闭。
+AFFINITY_PAGE_SIZE = int(os.environ.get("TRAE_AFFINITY_PAGE_SIZE") or 2)
+
+
+def estimate_prompt_tokens(payload, char_budget=4 * 1024 * 1024):
+    """粗估本次请求的输入规模（token）。只用于「超长会话」判定。
+
+    不参与计费、不参与护栏（护栏用的是输出上限，见 estimate_request_tokens）。
+    口径：messages 的 content + tools 的序列化长度，字符数 / 4，最多数
+    char_budget 个字符。
+
+    **只数一层**：早先的实现深度遍历 messages 里每个小字段，在「很多小消息」
+    的会话上要几十毫秒（实测 2 万条约 47ms、2000 个工具 33ms），而这里只需要
+    一个数量级正确的数 —— content 是正文的全部重量，其余字段可以忽略。
+    """
+    if not isinstance(payload, dict):
+        return 0
+    budget = max(0, int(char_budget))
+    chars = 0
+    for message in payload.get("messages") or ():
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, (list, tuple)):
+            # 分段 content（Anthropic / Responses 形态）：只数 text 部分
+            for part in content:
+                if isinstance(part, str):
+                    chars += len(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        chars += len(text)
+        if chars >= budget:
+            return budget // 4
+    tools = payload.get("tools")
+    if isinstance(tools, (list, tuple)) and tools:
+        try:
+            chars += len(json.dumps(tools, ensure_ascii=False))
+        except (TypeError, ValueError):
+            pass
+    return min(chars, budget) // 4
+
+
+def affinity_page_for(session_key, tokens=0, realm=None):
+    """超长会话该落在哪一页：(index, size)；不需要轮转时返回 None。
+
+    页索引由 session_key 稳定派生（同一段会话永远是同一页），size 超过池子大小
+    时返回 None —— 「整池就是一页」等于没分页，那时粘性绑定更划算（缓存更热）。
+    """
+    if not session_key or AFFINITY_PAGE_SIZE <= 1:
+        return None
+    if AFFINITY_PAGE_TOKENS <= 0 or tokens < AFFINITY_PAGE_TOKENS:
+        return None
+    try:
+        accounts = list(POOL.by_realm(realm)) if POOL is not None else []
+    except Exception:
+        accounts = []
+    if len(accounts) <= AFFINITY_PAGE_SIZE:
+        return None
+    digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) % AFFINITY_PAGE_SIZE, AFFINITY_PAGE_SIZE)
+
+
+def _pick_account_for_turn(realm, session_key, tried, model, page):
+    """按会话选号；page 透传给支持它的号池，老桩对象只认老签名时退回。
+
+    测试桩 / 嵌入方可能没有 page 参数（新能力，不是必需能力）：TypeError 只
+    在「不认识这个关键字」时降级重试，方法内部抛出的 TypeError 原样上抛。
+    """
+    if POOL is None:
+        return None
+    kwargs = dict(realm=realm, session_key=session_key, exclude=tried,
+                  model=model)
+    try:
+        return POOL.pick_for_session(page=page, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return POOL.pick_for_session(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 区域连坐暂停：派发前的闸门
+# ---------------------------------------------------------------------------
+#: 同一个区域反复被拦时，这条告警最多每 60 秒打一次（否则每个客户端请求一行）。
+_HOLD_LOG_INTERVAL = 60.0
+_hold_logged = {}
+
+
+def realm_label(realm):
+    """区域的中文名（只用于给人看的文案：日志 / 报错；面板有它自己的一份）。"""
+    key = str(realm or "").strip().lower()
+    if key == "cn":
+        return "国内版"
+    if key == "intl":
+        return "国际版"
+    return realm or "?"
+
+
+def realm_hold_message(realm, remaining):
+    """暂停期间交给客户端的说明（中文，可直接回给用户）。"""
+    return (
+        "上游已在本区域（%s）批量限制账号（风控连坐）：网关暂停派发 %d 秒，"
+        "期间不换号重试 —— 继续换号只会把同一设备/出口上的其它账号一起送进去。"
+        "请检查出口 IP 与账号状态，暂停到期后自动恢复。"
+        % (realm_label(realm), int(max(0, remaining)))
+    )
+
+
+def realm_hold_guard(realm, now=None):
+    """区域连坐暂停期间直接快速失败：不打上游、不换号。返回剩余秒数（0 = 放行）。
+
+    换号正是放大器：同一设备/出口上的账号是按批处理的，继续试探只会把剩下的号
+    一个个送进去。这里把「暂停」做成一次带 Retry-After 的 429，客户端自然退避，
+    到期自动恢复，不需要重启网关。
+    """
+    remaining = trae_restriction.hold_remaining(realm, now=now)
+    if remaining <= 0:
+        return 0.0
+    moment = time.time()
+    if moment - float(_hold_logged.get(realm) or 0.0) >= _HOLD_LOG_INTERVAL:
+        _hold_logged[realm] = moment
+        log("realm '%s' dispatch paused for %ds after an upstream restriction "
+            "wave - refusing to rotate accounts"
+            % (realm, int(remaining)), level="WARN", tag="chat")
+    raise RegionHold(realm_hold_message(realm, remaining),
+                     wait=int(remaining))
+
+
+def _demote_session(session_key, account):
+    """换号时把出错的号从会话队首降到队尾（不是整条解绑）。
+
+    保留暖号：它往往还握着这段会话的前缀缓存，冷却结束后回到手上比重选一个
+    冷号便宜得多。降级是纯本地状态，失败不该影响错误处理路径。
+    """
+    if not session_key or POOL is None:
+        return
+    uid = getattr(account, "uid", "") or None
+    try:
+        POOL.affinity.demote(session_key, uid)
+    except Exception:
+        pass
+
+
+def _is_account_restriction(code, detail, dead=False):
+    """这次失败算不算「账号被上游限制」（计入区域连坐的波次）。
+
+    五条排除，都是为了不把整区误停：
+      · dead=True（TOKEN_EXPIRE / session_dead）—— 凭证坏了，重登即可，不是风控；
+      · 4008 / exceeded the quota —— 免费额度用尽，换号也没用但也与风控无关；
+      · 上游排队（10605 / isQueued / retryAfterSeconds）—— 上游忙，不是账号被限；
+      · 内容审核类 —— 输入的问题，换号不解决；
+      · 客户端参数 / 权限 / 鉴权类（_CLIENT_FAULT_MARKERS、1001 鉴权码，信封与
+        裸正文两种形态都算）—— 这次请求本身有问题（比如这个模型没给这个号开通），
+        换号也一样被拒。
+    命中：403 本身（上游对账号/出口的拒绝），或正文里的风控标记。
+    """
+    detail = detail or ""
+    if dead:
+        return False
+    if "4008" in detail or "exceeded the quota" in detail.lower():
+        return False
+    if "10605" in detail or "isQueued" in detail or "retryAfterSeconds" in detail:
+        return False
+    if any(m in detail for m in _CONTENT_POLICY_MARKERS):
+        return False
+    if any(m in detail for m in _CLIENT_FAULT_MARKERS):
+        return False
+    if "trae 1001" in detail or " auth:" in detail:
+        return False
+    # 裸 HTTP 正文（HTTPError.read）里的鉴权码：上游同样用 403 投递 1001，
+    # 但没有 "trae 1001" 那层信封包装，只按 403 判会把凭证问题算成扫荡。
+    if re.search(r'"code"\s*:\s*"?1001\b', detail):
+        return False
+    try:
+        code_i = int(code)
+    except (TypeError, ValueError):
+        code_i = 0
+    if code_i == 403:
+        return True
+    return "risk_control" in detail or "4015" in detail or "4019" in detail
 
 
 def extract_session_key(headers, payload):
@@ -8392,11 +8649,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
-    if session_key and POOL:
-        try:
-            POOL.affinity.unbind(session_key)
-        except Exception:
-            pass
+    _demote_session(session_key, account)
     # #29：口径必须与 open_upstream 一致 —— 用**本区域**就绪数，而不是全局账号数，
     # 否则双区池里本区域唯一账号会被当成多号池，冷却不压 3s。
     total = _realm_ready_total(getattr(account, "realm", "") or "", model)
@@ -8453,6 +8706,19 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
                 pass
             log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
                 % account.uid[:8], level="ERROR")
+        # 区域连坐：信封层的账号级限制同样计入波次（排队 10605 由
+        # _is_account_restriction 自己排除 —— 那是上游忙，不是账号被限制）。
+        if _is_account_restriction(status_int, detail, dead=dead):
+            until = trae_restriction.note_account_restriction(
+                getattr(account, "realm", "") or "", account.uid)
+            if until:
+                log("realm '%s' restriction wave detected via envelope - dispatch "
+                    "paused for %ds (account %s, HTTP %s)"
+                    % (getattr(account, "realm", ""),
+                       int(trae_restriction.hold_remaining(
+                           getattr(account, "realm", "") or "")),
+                       account.uid[:8], status_int),
+                    level="ERROR", tag="chat")
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            code=status_int, cooldown=15)
@@ -8646,6 +8912,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         realm = trae_realm(getattr(pinned, "realm", "") or realm)
     model_key = trae_catalog.resolve_upstream_key(model, realm=realm)
 
+    # 区域连坐暂停期间：不打上游、不换号（见 trae_restriction）。放在最前面，
+    # 连请求体都不用构造。
+    realm_hold_guard(realm)
+
     # 请求体与账号无关（鉴权在头上），构造一次即可
     body_obj = build_trae_body(payload, None, model_key, realm=realm)
     body_bytes = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
@@ -8663,6 +8933,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 % (session_key, len(body_obj.get("messages") or [])))
 
     total = _realm_ready_total(realm, model)
+    # 超长会话改走页轮转（固定账号测试不分页）：一份几十万 token 的 body 不该
+    # 永远压在某一个号上。短会话仍然是正常的会话粘性。
+    # 先过便宜判断再估算：分页关掉 / 没有会话键时，不该为一次估算去遍历整个
+    # prompt（2 万条小消息的会话实测要几十毫秒）。
+    affinity_page = None
+    if (pinned is None and session_key
+            and AFFINITY_PAGE_SIZE > 1 and AFFINITY_PAGE_TOKENS > 0):
+        affinity_page = affinity_page_for(session_key,
+                                          estimate_prompt_tokens(payload), realm)
     tried = set()
     guard_hit = None
     last_code = 0
@@ -8675,9 +8954,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         if pinned is not None:
             account = None if pinned.uid in tried else pinned
         else:
-            account = POOL.pick_for_session(
-                realm=realm, session_key=session_key,
-                exclude=tried, model=model) if POOL else None
+            account = _pick_account_for_turn(realm, session_key, tried, model,
+                                             affinity_page)
         if account is None:
             if pinned is None and not waited_cool:
                 wait = _short_error_cooldown_wait(realm, model, exclude=tried)
@@ -8690,8 +8968,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     continue
             break
         if trae_realm(account.realm) != realm:
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+            # 选到别的区的号：降级（保留暖号），继续换号
+            _demote_session(session_key, account)
             continue
         tried.add(account.uid)
 
@@ -8799,8 +9077,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                                model=model, cooldown=60)
             log("account %s throttled on '%s' (429), cooling 60s"
                 % (account.uid[:8], model), level="WARN", tag="chat")
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+            _demote_session(session_key, account)
             saw_429 = True
             last_429_detail = detail
             continue
@@ -8817,10 +9094,22 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     pass
                 log("account %s session dead (TOKEN_EXPIRE) - disabled"
                     % account.uid[:8], level="ERROR")
+            _demote_session(session_key, account)
+            # 区域连坐：确实是账号级限制才计入波次（凭证过期/额度用尽不算）。
+            if _is_account_restriction(code, detail, dead=dead):
+                until = trae_restriction.note_account_restriction(realm, account.uid)
+                if until:
+                    log("realm '%s' restriction wave detected - dispatch paused "
+                        "for %ds (account %s, HTTP %s)"
+                        % (realm,
+                           int(trae_restriction.hold_remaining(realm)),
+                           account.uid[:8], code),
+                        level="ERROR", tag="chat")
+                    # 波次成立就停手：**本次请求**也不再换号。只挡下一个请求
+                    # 等于没挡 —— 这一轮已经把同批剩下的号全送进去了。
+                    realm_hold_guard(realm)
             log("account %s rejected (HTTP %s), rotating"
                 % (account.uid[:8], code), level="WARN", tag="chat")
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
             continue
         if _is_transient_upstream(code, detail) \
                 or _is_transient_transport(exc_obj):
@@ -8831,14 +9120,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 "- short cooldown, rotating"
                 % (code, TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
                 level="WARN", tag="chat")
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+            _demote_session(session_key, account)
             continue
         if 400 <= code < 500:
             account.note_error("HTTP %s: %s" % (code, detail[:120]),
                                code=code, model=model)
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+            _demote_session(session_key, account)
             continue
         raise UpstreamStatus(code or 502, detail or str(exc_obj)[:300])
 
@@ -10416,11 +10703,18 @@ class Handler(BaseHTTPRequestHandler):
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering."""
         wait = max(1, int(getattr(exc, "wait", 60) or 60))
+        detail = getattr(exc, "detail", "") or ""
+        if isinstance(exc, RegionHold):
+            # 区域连坐暂停：这不是上游对本次请求的限流，别让客户端以为「换个
+            # 模型/换把 key 就能过」—— 整个区域都被网关停下来了。
+            message = detail or ("网关已暂停该区域派发 %ds（上游风控连坐）" % wait)
+        else:
+            message = (("upstream rate limit reached for this model; "
+                        "retry in %ds" % wait)
+                       + ((" - " + detail[:200]) if detail else ""))
         body = json.dumps({
             "error": {
-                "message": ("upstream rate limit reached for this model; "
-                            "retry in %ds" % wait)
-                + ((" - " + exc.detail[:200]) if getattr(exc, "detail", "") else ""),
+                "message": message,
                 "type": "rate_limit_error",
                 "code": 429,
                 "retry_after": wait,
@@ -11597,6 +11891,13 @@ class Handler(BaseHTTPRequestHandler):
             trae_settings.set_auth_disabled(ACCOUNTS_DIR,
                                              payload.get("auth_disabled"))
             reply["auth_disabled"] = bool(payload.get("auth_disabled"))
+        if "restriction" in payload or payload.get("restriction_clear"):
+            # 区域连坐暂停：保存阈值 / 立即解除（逻辑在 apply_restriction_payload，
+            # 与 HTTP 层分开，便于单测）。
+            extra, err = apply_restriction_payload(payload)
+            if err:
+                return self._error(400, err, "invalid_request_error")
+            reply.update(extra)
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -11893,6 +12194,19 @@ class Handler(BaseHTTPRequestHandler):
         result = None
 
         for _attempt in range(total + 1):
+            # 区域连坐暂停期间不派发（SOLO 通道走 cn 区，与 open_upstream 同一道
+            # 闸门）。放在循环里而不是循环前：本轮中途凑够一波时，下一轮同样挡住
+            # —— 继续换号就是把同批剩下的号一个个送进去。
+            try:
+                realm_hold_guard("cn")
+            except RateLimited as exc:
+                record_error(model, 429, exc.detail[:200],
+                             elapsed_ms=int((time.monotonic() - started) * 1000),
+                             stream=want_stream)
+                if stream_state["started"]:
+                    self._sse_safe_error(exc.detail, 429)
+                    return
+                return self._rate_limited(exc)
             acc = POOL.pick(realm="cn", exclude=tried, model=model) if POOL else None
             if acc is None:
                 break
@@ -13377,6 +13691,10 @@ def _account_probe(account, model=None):
                 "elapsed_ms": int((time.time() - started) * 1000)}
 
     try:
+        # 区域连坐暂停期间连「测试账号」也不打上游：它和真实请求走的是同一个
+        # 出口，测一次就是又试探一次（SOLO 分支不经过 open_upstream，闸门要
+        # 在这里也加一道，否则同一个按钮两种行为）。
+        realm_hold_guard(realm)
         if model in SOLO_AGENT_MODELS:
             if trae_token_expired(account):
                 trae_refresh_account(account, realm)
@@ -13408,6 +13726,10 @@ def _account_probe(account, model=None):
             status = int(getattr(exc, "status", 0) or 0)
         except Exception:
             status = 0
+        if not status and isinstance(exc, RateLimited):
+            # 连坐暂停 / 上游频控都没有 status 字段：429 是它们对外的语义
+            # （面板据此不当成账号故障，也不会给这个号记一次失败）。
+            status = 429
         if not status:
             m = re.search(r"status (\d{3})", str(exc))
             status = int(m.group(1)) if m else 500
@@ -13461,6 +13783,12 @@ def main():
             pass
         USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
         USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
+        # 连坐暂停的状态目录也得跟着 --usage-dir 走：它在 import 时就按默认
+        # usage 目录接过线了，不重新接线会把暂停写到另一个目录去。
+        try:
+            trae_restriction.configure(state_dir=USAGE_DIR)
+        except Exception:
+            pass
 
     # 拒绝启动第二份：Windows 上 SO_REUSEADDR 会让两个 socket 绑同一端口，
     # 连接被静默分流，极难诊断。
